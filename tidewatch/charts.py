@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import matplotlib.dates as mdates
+import numpy as np
 from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter, MaxNLocator, MultipleLocator
 
@@ -67,19 +68,50 @@ def _caption(text: str, sample: bool) -> str:
     return ("[SAMPLE DATA, DO NOT POST] " + text) if sample else text
 
 
-def _note(ax, x, y, text, *, above=True, align="center") -> None:
-    """A small annotation label with a ringed marker at (x, y)."""
+_NOTE_SPOTS = [  # (dx, dy) in points, ha, va: tried in order, best clear spot wins
+    (0, 10, "center", "bottom"), (0, -10, "center", "top"),
+    (10, 8, "left", "bottom"), (-10, 8, "right", "bottom"),
+    (10, -8, "left", "top"), (-10, -8, "right", "top"),
+    (0, 26, "center", "bottom"), (0, -26, "center", "top"),
+    (16, 0, "left", "center"), (-16, 0, "right", "center"),
+]
+
+
+def _line_pixels(ax, xs, ys, per_segment: int = 12) -> np.ndarray:
+    """The line's path in display pixels, densified so steep jumps count too."""
+    xn = np.asarray(mdates.date2num(xs) if not isinstance(xs[0], (int, float)) else xs, float)
+    pts = ax.transData.transform(np.column_stack([xn, np.asarray(ys, float)]))
+    t = np.linspace(0, 1, per_segment, endpoint=False)
+    a, b = pts[:-1], pts[1:]
+    dense = (a[:, None, :] + (b - a)[:, None, :] * t[None, :, None]).reshape(-1, 2)
+    return np.vstack([dense, pts[-1:]])
+
+
+def _note(ax, x, y, text, *, avoid=None) -> None:
+    """Ringed marker at (x, y) plus a label placed where it clears the plotted line
+    and stays inside the plot."""
     ax.scatter([x], [y], s=30, facecolor=BG, edgecolors=TEXT_2, linewidths=1.2, zorder=6)
-    ax.annotate(text, (x, y), xytext=(0, 9 if above else -9), textcoords="offset points",
-                ha=align, va="bottom" if above else "top", fontsize=8.2, color=TEXT_2, zorder=6)
-
-
-def _align_for(ax, x) -> str:
-    """Keep annotation text inside the plot near its left or right edge."""
-    x0, x1 = ax.get_xlim()
-    frac = (mdates.date2num(x) - x0) / (x1 - x0) if not isinstance(x, (int, float)) else \
-        (x - x0) / (x1 - x0)
-    return "right" if frac > 0.8 else ("left" if frac < 0.2 else "center")
+    renderer = ax.figure.canvas.get_renderer()
+    frame = ax.get_window_extent(renderer)
+    line = _line_pixels(ax, *avoid) if avoid else np.empty((0, 2))
+    best = None
+    for dx, dy, ha, va in _NOTE_SPOTS:
+        label = ax.annotate(text, (x, y), xytext=(dx, dy), textcoords="offset points", ha=ha,
+                            va=va, fontsize=8.2, color=TEXT_2, zorder=6)
+        box = label.get_window_extent(renderer).padded(8)
+        hits = int(((line[:, 0] >= box.x0) & (line[:, 0] <= box.x1) &
+                    (line[:, 1] >= box.y0) & (line[:, 1] <= box.y1)).sum())
+        outside = not (frame.x0 <= box.x0 and box.x1 <= frame.x1 and
+                       frame.y0 <= box.y0 and box.y1 <= frame.y1)
+        score = hits + (10_000 if outside else 0)
+        if best is None or score < best[0]:
+            if best:
+                best[1].remove()
+            best = (score, label)
+        else:
+            label.remove()
+        if score == 0:
+            break
 
 
 # 1. Total stablecoin supply -------------------------------------------------
@@ -115,7 +147,7 @@ def supply_chart(points: list[SupplyPoint], out: Path, *, days: int = 180,
     ys = [p.total_usd for p in recent]
     lo, hi = min(ys), max(ys)
     pad = (hi - lo) * 0.14 or lo * 0.01
-    ax.set_ylim(lo - pad, hi + pad * 1.6)
+    ax.set_ylim(lo - pad, hi + pad * 2.6)
     ax.set_xlim(xs[0], xs[-1] + timedelta(days=3))
     ax.fill_between(xs, ys, lo - pad, color=BRAND, alpha=0.08, linewidth=0)
     ax.plot(xs, ys, color=BRAND, linewidth=LINE_W, solid_capstyle="round", solid_joinstyle="round")
@@ -129,7 +161,7 @@ def supply_chart(points: list[SupplyPoint], out: Path, *, days: int = 180,
         if peak.day != last.day:
             _note(ax, peak.day, peak.total_usd,
                   f"Peak {fmt.usd(peak.total_usd)} · {_short_date(peak.day)}",
-                  align=_align_for(ax, peak.day))
+                  avoid=(xs, ys))
 
     ax.yaxis.tick_right()
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: fmt.usd(v, digits=0)))
@@ -290,6 +322,8 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
                     history[0])
     move = now - week_ago.price * 100
     trend = "flat this week" if abs(move) < 1 else f"{move:+.0f} pts this week"
+    span_move = now - history[0].price * 100
+    peak = max(history, key=lambda p: p.price)
 
     today = history[-1].at.date()
     span_days = max(1, round((history[-1].at - history[0].at).total_seconds() / 86400))
@@ -297,7 +331,10 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
         "Polymarket odds", market.question,
         f"Chance of Yes, last {span_days} days · {fmt.usd(market.volume_24h)} traded in 24h",
         "Data: Polymarket", _date_label(today),
-        hero=f"{now:.0f}%", hero_sub=trend, sample=sample,
+        hero=f"{now:.0f}%",
+        hero_sub=(f"{span_move:+.0f} pts in {span_days} days"
+                  if abs(move) < 1 and abs(span_move) >= 5 else trend),
+        sample=sample,
     )
     ax = frame.ax
     xs = [p.at for p in history]
@@ -311,7 +348,7 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
     if swing and abs(swing[1]) >= 5 and swing[0].at != xs[-1]:
         p, mv = swing
         _note(ax, p.at, p.price * 100, f"{mv:+.0f} pts in a day · {_short_date(p.at.date())}",
-              above=p.price < 0.85, align=_align_for(ax, p.at))
+              avoid=(xs, ys))
 
     ax.yaxis.tick_right()
     ax.yaxis.set_major_locator(MultipleLocator(25))
@@ -320,7 +357,12 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
 
     image = save(frame.fig, out / "odds.png")
-    caption = (f"Polymarket: {market.question}\n\nYes is at {now:.0f}%, {trend}. "
+    context = ""
+    if abs(span_move) >= 5:
+        context = f", {'up' if span_move > 0 else 'down'} {abs(span_move):.0f} pts over {span_days} days"
+        if peak.price * 100 - now >= 10:
+            context += f" (it peaked at {peak.price * 100:.0f}% on {_short_date(peak.at.date())})"
+    caption = (f"Polymarket: {market.question}\n\nYes is at {now:.0f}%, {trend}{context}. "
                f"{fmt.usd(market.volume_24h)} traded in the last 24 hours.\n\nData: Polymarket")
     alt = (f"Line chart of Polymarket odds for '{market.question}' over {span_days} days, "
            f"now {now:.0f}%, {trend}.")
