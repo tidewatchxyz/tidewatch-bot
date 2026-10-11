@@ -29,7 +29,7 @@ def _today() -> str:
 def _pick_market(fetcher: Fetcher, slug: str | None):
     if slug:
         return polymarket.fetch_market(fetcher, slug)
-    return next((m for m in polymarket.fetch_top_markets(fetcher) if m.is_binary_yes_no), None)
+    return polymarket.pick_market(polymarket.fetch_top_markets(fetcher))
 
 
 def _load(args, fetcher: Fetcher):
@@ -48,8 +48,13 @@ def _load(args, fetcher: Fetcher):
         # History depends on the market, so it starts as soon as the market is known.
         history_f = pool.submit(polymarket.fetch_history, fetcher, market.token_ids[0]) \
             if market and market.token_ids else None
-        return (coins_f.result(), points_f.result(), market,
-                history_f.result() if history_f else [])
+        history = []
+        if history_f:
+            try:
+                history = history_f.result()
+            except Exception as exc:  # noqa: BLE001  the stablecoin charts can still go out
+                print(f"Odds history unavailable: {exc}", file=sys.stderr)
+        return coins_f.result(), points_f.result(), market, history
 
 
 def cmd_daily(args) -> int:
@@ -77,10 +82,10 @@ def cmd_daily(args) -> int:
         ("movers", lambda: charts.movers_chart(coins, out, today, sample=args.sample)),
         ("pegs", lambda: charts.peg_chart(coins, out, today, sample=args.sample)),
     ]
-    if market and market.is_binary_yes_no:
+    if market and market.is_binary_yes_no and len(history) >= 2:
         jobs.append(("odds", lambda: charts.odds_chart(market, history, out, sample=args.sample)))
     else:
-        print("Skipping odds chart: no binary Yes/No market found", file=sys.stderr)
+        print("Skipping odds chart: no chart-worthy market or no price history", file=sys.stderr)
 
     posts, failed = [], 0
     for name, job in jobs:

@@ -27,6 +27,7 @@ class Stablecoin:
     prev_week: float | None
     prev_month: float | None
     price: float | None
+    yield_bearing: bool = False
 
     @property
     def change_7d(self) -> float | None:
@@ -65,6 +66,7 @@ def parse_stablecoins(raw: dict) -> list[Stablecoin]:
                 prev_week=_peg_amount(a.get("circulatingPrevWeek"), peg),
                 prev_month=_peg_amount(a.get("circulatingPrevMonth"), peg),
                 price=float(price) if isinstance(price, (int, float)) else None,
+                yield_bearing=a.get("yieldBearing") is True,
             )
         )
     out.sort(key=lambda s: s.circulating, reverse=True)

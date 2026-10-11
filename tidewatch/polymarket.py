@@ -8,9 +8,10 @@ Endpoints:
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .http import Fetcher
@@ -28,6 +29,8 @@ class Market:
     token_ids: list[str]
     volume_24h: float
     end_date: str | None
+    volume_1wk: float = 0.0
+    is_sports: bool = False
 
     @property
     def is_binary_yes_no(self) -> bool:
@@ -66,19 +69,24 @@ def parse_market(m: dict) -> Market | None:
     tokens = [str(t) for t in _json_list(m.get("clobTokenIds"))]
     if not m.get("question") or not outcomes:
         return None
-    vol = m.get("volume24hr") or m.get("volume24hrClob") or 0
-    try:
-        vol = float(vol)
-    except (TypeError, ValueError):
-        vol = 0.0
+    def num(*keys) -> float:
+        for k in keys:
+            try:
+                return float(m.get(k) or 0)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
     return Market(
         question=m["question"].strip(),
         slug=m.get("slug", ""),
         outcomes=outcomes,
         prices=prices,
         token_ids=tokens,
-        volume_24h=vol,
+        volume_24h=num("volume24hr", "volume24hrClob"),
         end_date=m.get("endDate"),
+        volume_1wk=num("volume1wk", "volume1wkClob"),
+        is_sports=bool(m.get("sportsMarketType") or m.get("gameStartTime")),
     )
 
 
@@ -94,7 +102,39 @@ def parse_history(raw: dict) -> list[PricePoint]:
     return pts
 
 
-def fetch_top_markets(fetcher: Fetcher, limit: int = 20) -> list[Market]:
+CRYPTO_MACRO = re.compile(
+    r"\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|crypto|stablecoins?|tether|usdt|usdc|circle|"
+    r"coinbase|binance|etf|fed|fomc|interest rates?|rate cuts?|inflation|cpi|recession|"
+    r"tariffs?|sec|treasury|token|airdrop|memecoin|microstrategy|strategy)\b", re.I)
+
+
+def _end(m: Market) -> datetime | None:
+    if not m.end_date:
+        return None
+    try:
+        return datetime.fromisoformat(m.end_date.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def chart_worthy(m: Market, now: datetime | None = None) -> bool:
+    """A market worth a 30-day odds chart: binary, not sports, live for another
+    week, and genuinely uncertain (8% to 92%)."""
+    now = now or datetime.now(timezone.utc)
+    end = _end(m)
+    return (m.is_binary_yes_no and not m.is_sports and m.yes_price is not None
+            and 0.08 <= m.yes_price <= 0.92
+            and (end is None or end - now >= timedelta(days=7)))
+
+
+def pick_market(markets: list[Market], now: datetime | None = None) -> Market | None:
+    """Best chart candidate: most weekly volume, crypto/macro questions boosted 5x."""
+    ok = [m for m in markets if chart_worthy(m, now)]
+    score = lambda m: (m.volume_1wk or m.volume_24h) * (5 if CRYPTO_MACRO.search(m.question) else 1)
+    return max(ok, key=score, default=None)
+
+
+def fetch_top_markets(fetcher: Fetcher, limit: int = 100) -> list[Market]:
     raw = fetcher.get_json(
         f"{GAMMA}/markets",
         {"active": "true", "closed": "false", "order": "volume24hr",
@@ -121,7 +161,7 @@ def fetch_history(fetcher: Fetcher, token_id: str, days: int = 30) -> list[Price
     raw = fetcher.get_json(
         f"{CLOB}/prices-history",
         {"market": token_id, "interval": "1m", "fidelity": 180},
-        name="polymarket_history",
+        name=f"polymarket_history_{token_id[:16]}",
     )
     pts = parse_history(raw)
     if len(pts) < 2:  # fall back to an explicit time window
@@ -129,7 +169,7 @@ def fetch_history(fetcher: Fetcher, token_id: str, days: int = 30) -> list[Price
         raw = fetcher.get_json(
             f"{CLOB}/prices-history",
             {"market": token_id, "startTs": now - days * 86400, "endTs": now, "fidelity": 180},
-            name="polymarket_history_window",
+            name=f"polymarket_history_window_{token_id[:16]}",
         )
         pts = parse_history(raw)
     return pts

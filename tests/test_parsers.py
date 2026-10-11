@@ -60,7 +60,7 @@ class ReplayTests(unittest.TestCase):
                 "defillama_stablecoins": sample.stablecoins_raw(),
                 "defillama_supply_chart": sample.supply_chart_raw(),
                 "polymarket_top_markets": sample.markets_raw(),
-                "polymarket_history": sample.history_raw(),
+                "polymarket_history_111": sample.history_raw(),
             }
             for name, data in files.items():
                 (raw / f"{name}.json").write_text(json.dumps(data))
@@ -87,6 +87,45 @@ class HeadlineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             post = charts.movers_chart(coins, Path(d), date(2026, 10, 11))
         self.assertIn(leader.symbol, post.headline)
+
+
+class RealDataRuleTests(unittest.TestCase):
+    """Rules learned from the first live run (11 Oct 2026)."""
+
+    def test_yield_bearing_excluded_from_peg_watch(self):
+        raw = sample.stablecoins_raw()
+        raw["peggedAssets"][1].update(symbol="USYC", price=1.1397, yieldBearing=True)
+        raw["peggedAssets"][2].update(symbol="reUSD", price=1.1068)  # unflagged yield token
+        coins = defillama.parse_stablecoins(raw)
+        with tempfile.TemporaryDirectory() as d:
+            post = charts.peg_chart(coins, Path(d), date(2026, 10, 11))
+        self.assertNotIn("USYC", post.alt_text)
+        self.assertNotIn("reUSD", post.alt_text)
+
+    def test_duplicate_symbols_use_names(self):
+        raw = sample.stablecoins_raw()
+        raw["peggedAssets"][0].update(symbol="OUSD", name="Open USD")
+        raw["peggedAssets"][11].update(symbol="OUSD", name="Origin Dollar",
+                                       circulating={"peggedUSD": 1e6})
+        coins = defillama.parse_stablecoins(raw)
+        with tempfile.TemporaryDirectory() as d:
+            post = charts.movers_chart(coins, Path(d), date(2026, 10, 11))
+        self.assertIn("Open USD", post.alt_text)
+
+    def test_market_picker_skips_sports_longshots_and_short_dated(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 10, 11, tzinfo=timezone.utc)
+
+        def mk(q, yes, vol, end="2026-12-31T00:00:00Z", sports=False):
+            return polymarket.Market(q, q, ["Yes", "No"], [yes, 1 - yes], ["1", "2"], vol, end,
+                                     volume_1wk=vol, is_sports=sports)
+
+        ms = [mk("Chiefs vs. Bills", 0.5, 9e6, sports=True),
+              mk("Will X win the 2028 nomination?", 0.002, 8e6),
+              mk("Ceasefire through October 12?", 0.5, 7e6, end="2026-10-13T00:00:00Z"),
+              mk("Will the Democrats win the House?", 0.6, 3e6),
+              mk("Will Bitcoin hit $150k in 2026?", 0.3, 1e6)]
+        self.assertEqual(polymarket.pick_market(ms, now).question, "Will Bitcoin hit $150k in 2026?")
 
 
 class ChartSmokeTests(unittest.TestCase):

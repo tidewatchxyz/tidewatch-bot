@@ -12,7 +12,7 @@ from pathlib import Path
 
 import matplotlib.dates as mdates
 from matplotlib.patches import Patch
-from matplotlib.ticker import FuncFormatter, MultipleLocator
+from matplotlib.ticker import FuncFormatter, MaxNLocator, MultipleLocator
 
 from . import fmt
 from .defillama import Stablecoin, SupplyPoint
@@ -38,6 +38,29 @@ def _date_label(d: date) -> str:
 
 def _short_date(d: date) -> str:
     return f"{d:%b} {d.day}"
+
+
+def _labels(coins: list[Stablecoin], universe: list[Stablecoin]) -> dict[int, str]:
+    """Symbol per coin, or a short name when two coins share a symbol (e.g. two OUSDs)."""
+    counts: dict[str, int] = {}
+    for c in universe:
+        counts[c.symbol] = counts.get(c.symbol, 0) + 1
+    out = {}
+    for c in coins:
+        if counts.get(c.symbol, 0) > 1:
+            name = c.name if len(c.name) <= 14 else c.name[:13].rstrip() + "."
+            out[id(c)] = name
+        else:
+            out[id(c)] = c.symbol
+    return out
+
+
+def is_dollar_pegged(c: Stablecoin) -> bool:
+    """True for coins meant to trade at $1. Yield-bearing tokens (USYC, USDY...) accrue
+    value above $1 by design, so they would show up as fake 'off peg' alarms."""
+    if c.peg_type != "peggedUSD" or c.price is None or c.yield_bearing:
+        return False
+    return c.price <= 1.03  # >3% above $1 is a yield token DefiLlama hasn't flagged
 
 
 def _caption(text: str, sample: bool) -> str:
@@ -134,10 +157,11 @@ def movers_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 
     leader = picked[0]
     picked.sort(key=lambda c: c.change_7d)  # drawn bottom-up: biggest mint on top
     net = sum(c.change_7d for c in usd)
+    name = _labels(picked, coins)
 
     action = "minted" if leader.change_7d >= 0 else "redeemed"
-    headline = f"{fmt.usd(abs(leader.change_7d))} of {leader.symbol} was {action} this week"
-    labels = [c.symbol for c in picked]
+    headline = f"{fmt.usd(abs(leader.change_7d))} of {name[id(leader)]} was {action} this week"
+    labels = [name[id(c)] for c in picked]
     frame = new_frame(
         "Supply flows · 7 days", headline,
         "Biggest changes in circulating supply, last 7 days",
@@ -170,11 +194,11 @@ def movers_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 
 
     image = save(frame.fig, out / "movers.png")
     ranked = sorted(picked, key=lambda c: abs(c.change_7d), reverse=True)[:3]
-    parts = "\n".join(f"{c.symbol} {fmt.usd(c.change_7d, sign=True)}" for c in ranked)
+    parts = "\n".join(f"{name[id(c)]} {fmt.usd(c.change_7d, sign=True)}" for c in ranked)
     caption = (f"{headline}.\n\nBiggest supply moves, last 7 days:\n{parts}\n\n"
                f"Net across all USD stablecoins: {fmt.usd(net, sign=True)}.\n\nData: DefiLlama")
     alt = "Bar chart of 7-day stablecoin supply change: " + "; ".join(
-        f"{c.symbol} {fmt.usd(c.change_7d, sign=True)}" for c in reversed(picked)) + "."
+        f"{name[id(c)]} {fmt.usd(c.change_7d, sign=True)}" for c in reversed(picked)) + "."
     return Post("movers", image, headline, _caption(caption, sample), alt)
 
 
@@ -182,7 +206,7 @@ def movers_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 
 
 def peg_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 10,
               sample: bool = False) -> Post:
-    usd = [c for c in coins if c.peg_type == "peggedUSD" and c.price is not None][:top]
+    usd = [c for c in coins if is_dollar_pegged(c)][:top]
     if not usd:
         raise ValueError("No USD stablecoins with prices")
     devs = [(c.price - 1) * 10_000 for c in usd]
@@ -200,7 +224,7 @@ def peg_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 10,
 
     frame = new_frame(
         "Peg watch", headline,
-        f"Price vs $1 for the {n} largest USD stablecoins, in basis points (1 bp = 0.01%)",
+        f"Price vs $1, {n} largest USD stablecoins (yield-bearing excluded), in bps",
         "Data: DefiLlama", _date_label(today),
         hero=f"{n - len(off)}/{n}", hero_sub=f"within {PEG_BAND_BPS} bps of $1",
         sample=sample, plot_left=label_margin([c.symbol for c in usd]), plot_right=0.945,
@@ -223,7 +247,8 @@ def peg_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 10,
     ax.grid(False)
     ax.grid(axis="x", color=GRID, linewidth=0.6)
     ax.spines["bottom"].set_visible(False)
-    ax.xaxis.set_major_locator(MultipleLocator(50 if span <= 150 else 100))
+    ax.xaxis.set_major_locator(MultipleLocator(50) if span <= 150
+                               else MaxNLocator(nbins=6, steps=[1, 2, 2.5, 5, 10], symmetric=True))
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:+.0f}" if v else "$1.00"))
     ax.text(PEG_BAND_BPS, n - 0.45, f" ±{PEG_BAND_BPS} bps", fontsize=8, color=TEXT_3,
             va="top", ha="left")
@@ -267,9 +292,10 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
     trend = "flat this week" if abs(move) < 1 else f"{move:+.0f} pts this week"
 
     today = history[-1].at.date()
+    span_days = max(1, round((history[-1].at - history[0].at).total_seconds() / 86400))
     frame = new_frame(
         "Polymarket odds", market.question,
-        f"Chance of Yes, last 30 days · {fmt.usd(market.volume_24h)} traded in 24h",
+        f"Chance of Yes, last {span_days} days · {fmt.usd(market.volume_24h)} traded in 24h",
         "Data: Polymarket", _date_label(today),
         hero=f"{now:.0f}%", hero_sub=trend, sample=sample,
     )
@@ -296,6 +322,6 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
     image = save(frame.fig, out / "odds.png")
     caption = (f"Polymarket: {market.question}\n\nYes is at {now:.0f}%, {trend}. "
                f"{fmt.usd(market.volume_24h)} traded in the last 24 hours.\n\nData: Polymarket")
-    alt = (f"Line chart of Polymarket odds for '{market.question}' over 30 days, "
+    alt = (f"Line chart of Polymarket odds for '{market.question}' over {span_days} days, "
            f"now {now:.0f}%, {trend}.")
     return Post("odds", image, market.question, _caption(caption, sample), alt)
