@@ -46,6 +46,7 @@ BRAND = "#3DDC97"  # single-series lines (brand mint, same as pfp/banner)
 UP = "#1FA874"  # supply minted / positive change
 DOWN = "#D95926"  # supply redeemed / negative change
 NEUTRAL = "#6B7788"  # unremarkable dots
+RANGE = "#36445A"  # the span a value moved over a window, behind its dot
 WARN = "#C98500"  # status: off peg (always paired with a text label)
 
 WIDTH_IN, HEIGHT_IN, DPI = 6.4, 3.6, 250  # -> 1600 x 900 px
@@ -80,6 +81,9 @@ def fonts() -> Fonts:
             {
                 "font.family": mono,
                 "text.color": TEXT_2,
+                # Headlines carry real dollar signs ("$0.9921, off its $1 peg").
+                # Left on, matplotlib reads the pair as mathtext and eats them.
+                "text.parse_math": False,
                 "axes.edgecolor": AXIS,
                 "axes.labelcolor": TEXT_3,
                 "xtick.color": TEXT_3,

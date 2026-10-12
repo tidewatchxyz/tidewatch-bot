@@ -23,6 +23,7 @@ def stablecoins_raw(seed: int = 7) -> dict:
         assets.append({
             "name": f"Demo Dollar {chr(65 + i)}",
             "symbol": f"DEMO-{chr(65 + i)}",
+            "gecko_id": f"demo-dollar-{chr(97 + i)}",
             "pegType": "peggedUSD",
             "pegMechanism": "fiat-backed",
             "circulating": {"peggedUSD": size},
@@ -44,6 +45,25 @@ def supply_chart_raw(days: int = 400, seed: int = 7) -> list:
         ts = int((start + timedelta(days=d)).timestamp())
         rows.append({"date": str(ts), "totalCirculatingUSD": {"peggedUSD": total * 0.985,
                                                              "peggedEUR": total * 0.015}})
+    return rows
+
+
+def price_history_raw(days: int = 30, coins: int = 12, seed: int = 11) -> list:
+    """Daily prices in the /stablecoinprices shape, for the peg chart's range bars."""
+    rng = random.Random(seed)
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    start -= timedelta(days=days - 1)
+    rows = []
+    for d in range(days):
+        prices = {}
+        for i in range(coins):
+            gid = f"demo-dollar-{chr(97 + i)}"
+            wobble = rng.gauss(0, 0.0004 + 0.0002 * (i % 4))
+            if i == 7:  # the deliberately off-peg coin sags over the window
+                wobble -= 0.0075 * min(1.0, d / max(days - 8, 1))
+            prices[gid] = round(1 + wobble, 6)
+        rows.append({"date": str(int((start + timedelta(days=d)).timestamp())),
+                     "prices": prices})
     return rows
 
 

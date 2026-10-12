@@ -12,11 +12,11 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
-USER_AGENT = "tidewatch-bot/0.2 (+https://x.com/tidewatchxyz)"
+USER_AGENT = "tidewatch-bot/0.3 (+https://x.com/tidewatchxyz)"
 
 
 class FetchError(RuntimeError):
@@ -45,7 +45,11 @@ class Fetcher:
             self._local.session = s
         return s
 
-    def get_json(self, url: str, params: dict[str, Any] | None = None, *, name: str) -> Any:
+    def get_json(self, url: str, params: dict[str, Any] | None = None, *, name: str,
+                 trim: Callable[[Any], Any] | None = None) -> Any:
+        """Fetch and archive JSON. `trim` (for responses that are mostly history no
+        chart reads) is applied before both the archive and the return value, so a
+        replay sees exactly what the live run saw."""
         if self.replay_dir is not None:
             path = self.replay_dir / f"{_safe(name)}.json"
             if not path.exists():
@@ -60,6 +64,8 @@ class Fetcher:
                     raise FetchError(f"HTTP {resp.status_code}")
                 resp.raise_for_status()
                 data = resp.json()
+                if trim is not None:
+                    data = trim(data)
                 self._archive(name, data)
                 return data
             except (requests.RequestException, ValueError, FetchError) as exc:

@@ -128,6 +128,101 @@ class RealDataRuleTests(unittest.TestCase):
         self.assertEqual(polymarket.pick_market(ms, now).question, "Will Bitcoin hit $150k in 2026?")
 
 
+class PegRangeTests(unittest.TestCase):
+    @staticmethod
+    def _rows(series: dict[str, list[float]]) -> list:
+        n = max(len(v) for v in series.values())
+        return [{"date": str(1_700_000_000 + i * 86_400),
+                 "prices": {gid: vals[i] for gid, vals in series.items() if i < len(vals)}}
+                for i in range(n)]
+
+    def test_low_high_in_bps(self):
+        rows = self._rows({"tether": [1.0, 0.9990, 1.0002, 0.9995]})
+        r = defillama.parse_peg_ranges(rows, ["tether"])["tether"]
+        self.assertAlmostEqual(r.low_bps, -10.0, places=6)
+        self.assertAlmostEqual(r.high_bps, 2.0, places=6)
+        self.assertAlmostEqual(r.width_bps, 12.0, places=6)
+        self.assertAlmostEqual(r.worst_bps, -10.0, places=6)  # furthest from $1, signed
+        self.assertEqual(r.days, 4)
+
+    def test_only_the_trailing_window(self):
+        rows = self._rows({"dai": [0.50] + [1.0] * 30})  # the 0.50 is older than 30 days
+        r = defillama.parse_peg_ranges(rows, ["dai"], days=30)["dai"]
+        self.assertEqual(r.days, 30)
+        self.assertAlmostEqual(r.low_bps, 0.0, places=6)
+
+    def test_unwanted_ids_and_bad_values_skipped(self):
+        rows = [{"date": "1700000000",
+                 "prices": {"tether": 1.0, "dai": None, "usd-coin": "x", "other": 1.0}}]
+        out = defillama.parse_peg_ranges(rows, ["tether", "dai", "usd-coin"])
+        self.assertEqual(list(out), ["tether"])
+
+    def test_no_ids_or_junk_payload_gives_nothing(self):
+        self.assertEqual(defillama.parse_peg_ranges(self._rows({"dai": [1.0]}), []), {})
+        self.assertEqual(defillama.parse_peg_ranges({"oops": 1}, ["dai"]), {})
+
+    def test_trim_keeps_trailing_rows_in_order(self):
+        rows = list(reversed(self._rows({"dai": [1.0] * 10})))  # arrives newest-first
+        kept = defillama.trim_price_history(rows, days=3)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual([int(r["date"]) for r in kept], sorted(int(r["date"]) for r in kept))
+        self.assertEqual(int(kept[-1]["date"]), 1_700_000_000 + 9 * 86_400)
+
+
+class PegChartTests(unittest.TestCase):
+    def _coins(self, prices=None):
+        raw = sample.stablecoins_raw()
+        for i, a in enumerate(raw["peggedAssets"]):
+            a["price"] = 1.0 if prices is None else prices(i)
+        return defillama.parse_stablecoins(raw)
+
+    def _render(self, coins, ranges):
+        with tempfile.TemporaryDirectory() as d:
+            return charts.peg_chart(coins, Path(d), date(2026, 10, 11), ranges=ranges)
+
+    def test_calm_month_says_so_and_shows_ranges(self):
+        coins = self._coins()
+        ranges = {c.gecko_id: defillama.PegRange(-8.0, 2.0, 30) for c in coins}
+        post = self._render(coins, ranges)
+        self.assertIn("held their $1 peg this month", post.headline)
+        self.assertIn("30-day", post.alt_text)
+        self.assertIn("-8 bps to +2 bps", post.caption)  # the widest swing, spelled out
+
+    def test_intramonth_break_is_reported_even_when_calm_today(self):
+        """The old chart only saw today, so a mid-month depeg went unmentioned."""
+        coins = self._coins()
+        ranges = {c.gecko_id: defillama.PegRange(-2.0, 2.0, 30) for c in coins}
+        ranges[coins[3].gecko_id] = defillama.PegRange(-180.0, 1.0, 30)
+        post = self._render(coins, ranges)
+        self.assertIn(coins[3].symbol, post.headline)
+        self.assertIn("back near $1 today", post.headline)
+
+    def test_off_peg_today_still_leads(self):
+        coins = self._coins(prices=lambda i: 0.9921 if i == 3 else 1.0)
+        ranges = {c.gecko_id: defillama.PegRange(-79.0, 1.0, 30) for c in coins}
+        post = self._render(coins, ranges)
+        self.assertIn("off its $1 peg", post.headline)
+        self.assertIn(coins[3].symbol, post.headline)
+
+    def test_renders_without_any_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            post = charts.peg_chart(self._coins(), Path(d), date(2026, 10, 11), ranges={})
+            self.assertTrue(post.image.exists())
+        self.assertIn("are holding their $1 peg", post.headline)
+
+    def test_flat_coin_reads_as_flat_not_missing(self):
+        coins = self._coins()
+        ranges = {c.gecko_id: defillama.PegRange(0.0, 0.0, 30) for c in coins}
+        self.assertIn("flat for all 30 days", self._render(coins, ranges).alt_text)
+
+    def test_dollar_signs_survive_rendering(self):
+        """Two $ in one string used to be eaten as mathtext ("off its $1 peg")."""
+        from matplotlib import pyplot as plt
+        from tidewatch import style
+        style.fonts()
+        self.assertFalse(plt.rcParams["text.parse_math"])
+
+
 class ChartSmokeTests(unittest.TestCase):
     def test_all_charts_render(self):
         coins = defillama.parse_stablecoins(sample.stablecoins_raw())
@@ -140,7 +235,8 @@ class ChartSmokeTests(unittest.TestCase):
             posts = [
                 charts.supply_chart(points, out, sample=True),
                 charts.movers_chart(coins, out, today, sample=True),
-                charts.peg_chart(coins, out, today, sample=True),
+                charts.peg_chart(coins, out, today, sample=True, ranges=defillama.parse_peg_ranges(
+                    sample.price_history_raw(), [c.gecko_id for c in coins])),
                 charts.odds_chart(market, history, out, sample=True),
             ]
             for p in posts:

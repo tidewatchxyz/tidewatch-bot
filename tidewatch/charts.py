@@ -16,12 +16,13 @@ from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter, MaxNLocator, MultipleLocator
 
 from . import fmt
-from .defillama import Stablecoin, SupplyPoint
+from .defillama import PEG_WINDOW_DAYS, PegRange, Stablecoin, SupplyPoint
 from .polymarket import Market, PricePoint
-from .style import (BAND, BG, BRAND, DOWN, GRID, LINE_W, NEUTRAL, TEXT, TEXT_2, TEXT_3, UP,
-                    WARN, end_dot, label_margin, new_frame, rounded_hbars, save)
+from .style import (BAND, BG, BRAND, DOWN, GRID, LINE_W, NEUTRAL, RANGE, TEXT, TEXT_2, TEXT_3,
+                    UP, WARN, end_dot, label_margin, new_frame, rounded_hbars, save)
 
 PEG_BAND_BPS = 50
+MIN_PEG_SPAN_BPS = 15.0  # never zoom in tighter than this, or noise looks like news
 
 
 @dataclass
@@ -62,6 +63,15 @@ def is_dollar_pegged(c: Stablecoin) -> bool:
     if c.peg_type != "peggedUSD" or c.price is None or c.yield_bearing:
         return False
     return c.price <= 1.03  # >3% above $1 is a yield token DefiLlama hasn't flagged
+
+
+def _clear_of(lo: float, hi: float, span: float) -> tuple[float, str]:
+    """Where to put a label so it sits beside a mark spanning lo..hi, not on it.
+    Picks whichever side has more room before the axis edge."""
+    pad = span * 0.035
+    if (span - hi) >= (lo + span):
+        return hi + pad, "left"
+    return lo - pad, "right"
 
 
 def _caption(text: str, sample: bool) -> str:
@@ -236,65 +246,128 @@ def movers_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 
 
 # 3. Peg watch ------------------------------------------------------------------
 
-def peg_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 10,
+def peg_chart(coins: list[Stablecoin], out: Path, today: date, *,
+              ranges: dict[str, PegRange] | None = None, top: int = 10,
               sample: bool = False) -> Post:
     usd = [c for c in coins if is_dollar_pegged(c)][:top]
     if not usd:
         raise ValueError("No USD stablecoins with prices")
+    ranges = ranges or {}
     devs = [(c.price - 1) * 10_000 for c in usd]
+    rngs = [ranges.get(c.gecko_id) for c in usd]
     off = [(c, d) for c, d in zip(usd, devs) if abs(d) > PEG_BAND_BPS]
+    strayed = [(c, r) for c, r in zip(usd, rngs)
+               if r and abs(r.worst_bps) > PEG_BAND_BPS]
     n = len(usd)
+    window = f"{PEG_WINDOW_DAYS}-day"
+    have_ranges = any(rngs)
 
-    if not off:
-        headline = f"All {n} of the biggest stablecoins are holding their $1 peg"
-    elif len(off) == 1:
-        c, d = off[0]
-        headline = (f"{c.symbol} slipped to ${c.price:.4f}, off its $1 peg" if d < 0
-                    else f"{c.symbol} is trading above its peg at ${c.price:.4f}")
+    if off:
+        if len(off) == 1:
+            c, d = off[0]
+            headline = (f"{c.symbol} slipped to ${c.price:.4f}, off its $1 peg" if d < 0
+                        else f"{c.symbol} is trading above its peg at ${c.price:.4f}")
+        else:
+            headline = f"{len(off)} of the {n} biggest stablecoins are off their $1 peg"
+    elif strayed:
+        # Calm today, but something broke the band earlier in the window.
+        if len(strayed) == 1:
+            c, r = strayed[0]
+            headline = (f"{c.symbol} hit {fmt.bps(r.worst_bps)} off peg this month, "
+                        f"back near $1 today")
+        else:
+            headline = (f"{len(strayed)} of the {n} biggest stablecoins broke "
+                        f"their peg band this month, all back now")
+    elif have_ranges:
+        headline = f"All {n} of the biggest stablecoins held their $1 peg this month"
     else:
-        headline = f"{len(off)} of the {n} biggest stablecoins are off their $1 peg"
+        headline = f"All {n} of the biggest stablecoins are holding their $1 peg"
 
+    subtitle = (f"Price and {window} range vs $1, top {n} USD stablecoins, no yield tokens"
+                if have_ranges else
+                f"Price vs $1, {n} largest USD stablecoins (yield-bearing excluded), in bps")
     frame = new_frame(
-        "Peg watch", headline,
-        f"Price vs $1, {n} largest USD stablecoins (yield-bearing excluded), in bps",
+        "Peg watch", headline, subtitle,
         "Data: DefiLlama", _date_label(today),
-        hero=f"{n - len(off)}/{n}", hero_sub=f"within {PEG_BAND_BPS} bps of $1",
+        hero=f"{n - len(off)}/{n}",
+        hero_sub=f"within {PEG_BAND_BPS} bps of $1 today" if have_ranges
+                 else f"within {PEG_BAND_BPS} bps of $1",
         sample=sample, plot_left=label_margin([c.symbol for c in usd]), plot_right=0.945,
     )
     ax = frame.ax
     ys = list(range(n))[::-1]  # largest at the top
-    span = max(100.0, max(abs(d) for d in devs) * 1.3)
-    ax.axvspan(-PEG_BAND_BPS, PEG_BAND_BPS, color=BAND, zorder=0, linewidth=0)
+    reach = [abs(d) for d in devs] + [abs(v) for r in rngs if r
+                                      for v in (r.low_bps, r.high_bps)]
+    # Scale to the data, not to a fixed +/-100: on a calm day that floor squashed
+    # every dot into one unreadable column in the middle.
+    span = max(MIN_PEG_SPAN_BPS, max(reach) * 1.3)
+    show_band = span >= PEG_BAND_BPS
+    if show_band:
+        ax.axvspan(-PEG_BAND_BPS, PEG_BAND_BPS, color=BAND, zorder=0, linewidth=0)
     ax.axvline(0, color=TEXT_3, linewidth=0.7, zorder=1)
-    for y, c, d in zip(ys, usd, devs):
+    for y, c, d, r in zip(ys, usd, devs, rngs):
+        if r and r.width_bps > 0:
+            ax.plot([r.low_bps, r.high_bps], [y, y], color=RANGE, linewidth=4.6,
+                    solid_capstyle="round", zorder=2)
         is_off = abs(d) > PEG_BAND_BPS
         ax.scatter([d], [y], s=52 if is_off else 34, color=WARN if is_off else NEUTRAL,
                    zorder=3, edgecolors=BG, linewidths=1.4)
-        if is_off:  # label points toward the center, away from the axis edges
-            ax.text(d + (-span * 0.045 if d >= 0 else span * 0.045), y, f"{fmt.bps(d)} · off peg",
-                    va="center", ha="right" if d >= 0 else "left", fontsize=8.6, color=TEXT)
+        if is_off:
+            x, ha = _clear_of(min(d, r.low_bps if r else d),
+                              max(d, r.high_bps if r else d), span)
+            ax.text(x, y, f"{fmt.bps(d)} · off peg", va="center", ha=ha,
+                    fontsize=8.6, color=TEXT)
+
+    widest = max((p for p in zip(ys, usd, rngs) if p[2]),
+                 key=lambda p: p[2].width_bps, default=None)
+    if not off and widest:  # one annotation: the month's widest wobble
+        y, c, r = widest
+        x, ha = _clear_of(r.low_bps, r.high_bps, span)
+        ax.text(x, y, f"{round(r.width_bps)} bps range in {PEG_WINDOW_DAYS} days",
+                va="center", ha=ha, fontsize=8.4, color=TEXT_2)
+
     ax.set_xlim(-span, span)
     ax.set_ylim(-0.7, n - 0.3)
     ax.set_yticks(ys, [c.symbol for c in usd], fontsize=9, color=TEXT_2)
     ax.grid(False)
     ax.grid(axis="x", color=GRID, linewidth=0.6)
     ax.spines["bottom"].set_visible(False)
-    ax.xaxis.set_major_locator(MultipleLocator(50) if span <= 150
-                               else MaxNLocator(nbins=6, steps=[1, 2, 2.5, 5, 10], symmetric=True))
+    ax.xaxis.set_major_locator(MultipleLocator(50) if 30 < span <= 150
+                               else MaxNLocator(nbins=6, steps=[1, 2, 2.5, 5, 10],
+                                                symmetric=True))
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:+.0f}" if v else "$1.00"))
-    ax.text(PEG_BAND_BPS, n - 0.45, f" ±{PEG_BAND_BPS} bps", fontsize=8, color=TEXT_3,
-            va="top", ha="left")
+    if show_band:
+        ax.text(PEG_BAND_BPS, n - 0.45, f" ±{PEG_BAND_BPS} bps", fontsize=8, color=TEXT_3,
+                va="top", ha="left")
 
     image = save(frame.fig, out / "pegs.png")
+    lines = []
     if off:
-        detail = "\n".join(f"{c.symbol}: ${c.price:.4f} ({fmt.bps(d)})" for c, d in off)
-        caption = f"{headline}.\n\n{detail}\n\nEveryone else in the top {n} is within 0.5% of $1.\n\nData: DefiLlama"
+        lines.append("\n".join(f"{c.symbol}: ${c.price:.4f} ({fmt.bps(d)})" for c, d in off))
+        lines.append(f"Everyone else in the top {n} is within 0.5% of $1.")
     else:
         worst_c, worst_d = max(zip(usd, devs), key=lambda t: abs(t[1]))
-        caption = (f"{headline}.\n\nWidest gap today: {worst_c.symbol} at ${worst_c.price:.4f} "
-                   f"({fmt.bps(worst_d)}).\n\nData: DefiLlama")
-    alt = "Dot plot of each stablecoin's price deviation from $1: " + "; ".join(
-        f"{c.symbol} {fmt.bps(d)}" for c, d in zip(usd, devs)) + "."
+        lines.append(f"Widest gap today: {worst_c.symbol} at ${worst_c.price:.4f} "
+                     f"({fmt.bps(worst_d)}).")
+    if widest:
+        _, c, r = widest
+        lines.append(f"Widest {window} swing: {c.symbol}, {fmt.bps(r.low_bps)} to "
+                     f"{fmt.bps(r.high_bps)}.")
+    caption = f"{headline}.\n\n" + "\n\n".join(lines) + "\n\nData: DefiLlama"
+
+    if have_ranges:
+        def _say(c: Stablecoin, d: float, r: PegRange | None) -> str:
+            if r is None:
+                return f"{c.symbol} {fmt.bps(d)}"
+            if round(r.low_bps) == round(r.high_bps):
+                return f"{c.symbol} {fmt.bps(d)}, flat for all {PEG_WINDOW_DAYS} days"
+            return (f"{c.symbol} {fmt.bps(d)}, {window} {fmt.bps(r.low_bps)} "
+                    f"to {fmt.bps(r.high_bps)}")
+        alt = (f"Dot plot of each stablecoin's price vs $1 today with its {window} range: "
+               + "; ".join(_say(c, d, r) for c, d, r in zip(usd, devs, rngs)) + ".")
+    else:
+        alt = "Dot plot of each stablecoin's price deviation from $1: " + "; ".join(
+            f"{c.symbol} {fmt.bps(d)}" for c, d in zip(usd, devs)) + "."
     return Post("pegs", image, headline, _caption(caption, sample), alt)
 
 

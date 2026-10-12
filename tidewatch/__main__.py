@@ -33,16 +33,20 @@ def _pick_market(fetcher: Fetcher, slug: str | None):
 
 
 def _load(args, fetcher: Fetcher):
-    """Return (stablecoins, supply points, market, history), fetching in parallel."""
+    """Return (stablecoins, supply points, peg ranges, market, history), fetched in parallel."""
     if args.sample:
-        return (defillama.parse_stablecoins(sample.stablecoins_raw()),
+        coins = defillama.parse_stablecoins(sample.stablecoins_raw())
+        return (coins,
                 defillama.parse_supply_chart(sample.supply_chart_raw()),
+                defillama.parse_peg_ranges(sample.price_history_raw(),
+                                           [c.gecko_id for c in coins]),
                 polymarket.parse_market(sample.markets_raw()[0]),
                 polymarket.parse_history(sample.history_raw()))
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         coins_f = pool.submit(defillama.fetch_stablecoins, fetcher)
         points_f = pool.submit(defillama.fetch_supply_chart, fetcher)
+        prices_f = pool.submit(defillama.fetch_price_history, fetcher)
         market_f = pool.submit(_pick_market, fetcher, args.market)
         market = market_f.result()
         # History depends on the market, so it starts as soon as the market is known.
@@ -54,7 +58,14 @@ def _load(args, fetcher: Fetcher):
                 history = history_f.result()
             except Exception as exc:  # noqa: BLE001  the stablecoin charts can still go out
                 print(f"Odds history unavailable: {exc}", file=sys.stderr)
-        return coins_f.result(), points_f.result(), market, history
+        coins = coins_f.result()
+        try:
+            ranges = defillama.parse_peg_ranges(prices_f.result(),
+                                                [c.gecko_id for c in coins])
+        except Exception as exc:  # noqa: BLE001  peg chart still works without history
+            print(f"Peg history unavailable: {exc}", file=sys.stderr)
+            ranges = {}
+        return coins, points_f.result(), ranges, market, history
 
 
 def cmd_daily(args) -> int:
@@ -70,7 +81,7 @@ def cmd_daily(args) -> int:
         fetcher = Fetcher(raw_dir=out / "raw")
 
     try:
-        coins, points, market, history = _load(args, fetcher)
+        coins, points, ranges, market, history = _load(args, fetcher)
     except Exception as exc:  # noqa: BLE001
         print(f"Data fetch failed: {exc}", file=sys.stderr)
         return 1
@@ -80,7 +91,8 @@ def cmd_daily(args) -> int:
     jobs = [
         ("supply", lambda: charts.supply_chart(points, out, sample=args.sample)),
         ("movers", lambda: charts.movers_chart(coins, out, today, sample=args.sample)),
-        ("pegs", lambda: charts.peg_chart(coins, out, today, sample=args.sample)),
+        ("pegs", lambda: charts.peg_chart(coins, out, today, ranges=ranges,
+                                          sample=args.sample)),
     ]
     if market and market.is_binary_yes_no and len(history) >= 2:
         jobs.append(("odds", lambda: charts.odds_chart(market, history, out, sample=args.sample)))

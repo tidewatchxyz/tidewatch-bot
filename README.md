@@ -8,7 +8,7 @@ Every run makes four 1600x900 PNGs, each with a draft caption and alt text:
 |---|---|---|
 | `supply.png` | Total stablecoin supply, last 180 days, with the 30-day change | DefiLlama |
 | `movers.png` | Biggest 7-day mints and redemptions, plus the net across all USD stablecoins | DefiLlama |
-| `pegs.png` | Price vs $1 for the 10 largest USD stablecoins, flagging anything more than 50 bps off | DefiLlama |
+| `pegs.png` | Price today plus the 30-day range vs $1 for the 10 largest USD stablecoins, flagging anything more than 50 bps off | DefiLlama |
 | `odds.png` | 30-day Yes odds for one Polymarket market (the most traded one, or one you pick) | Polymarket |
 
 Both APIs are free and need no key.
@@ -46,6 +46,10 @@ out/2026-10-11/
 
 Keep `raw/`. If someone questions a number, you can show exactly what the data said that day.
 
+`defillama_stablecoin_prices.json` is the one trimmed file: the endpoint returns about
+6 MB of history going back to 2020, so only the trailing 30 days the peg chart reads are
+kept. Rows are saved whole, so every price behind the chart is still there.
+
 ## Run it daily on GitHub (free)
 
 `.github/workflows/daily.yml` runs every day at 05:15 UTC (08:15 in Addis). To use it:
@@ -64,6 +68,10 @@ The bot drafts posts and you post them by hand. That's on purpose: you read the 
 
 Dark surface `#0D1117`, brand mint `#3DDC97` for single lines, Archivo Black titles, IBM Plex Mono for everything else. Minted vs redeemed uses mint `#1FA874` and orange `#D95926`, a pair checked for color-blind safety on the dark background. Off-peg dots use amber and always carry a text label.
 
+The peg chart scales to the day's data rather than a fixed ±100 bps, with a floor of ±15 bps
+so ordinary noise never gets magnified into news. The ±50 bps band is drawn only when it fits
+on that scale.
+
 Fonts are bundled under the SIL Open Font License (see `tidewatch/fonts/`).
 
 ## Ideas for next versions
@@ -71,3 +79,4 @@ Fonts are bundled under the SIL Open Font License (see `tidewatch/fonts/`).
 - Stablecoin supply by chain (Ethereum, Tron, Solana, Base)
 - Weekly thread: the week's supply moves plus the biggest odds swings
 - Alerts when a large stablecoin moves more than 50 bps off peg
+- Trim the `USDX Money US.` style of truncated name in labels and captions
