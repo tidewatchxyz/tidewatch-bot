@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import requests
 
-USER_AGENT = "tidewatch-bot/0.3 (+https://x.com/tidewatchxyz)"
+USER_AGENT = "tidewatch-bot/0.4 (+https://x.com/tidewatchxyz)"
 
 
 class FetchError(RuntimeError):

@@ -7,7 +7,7 @@ data), backs it with one hero number, and annotates at most one point.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import matplotlib.dates as mdates
@@ -23,6 +23,8 @@ from .style import (BAND, BG, BRAND, DOWN, GRID, LINE_W, NEUTRAL, RANGE, TEXT, T
 
 PEG_BAND_BPS = 50
 MIN_PEG_SPAN_BPS = 15.0  # never zoom in tighter than this, or noise looks like news
+LABEL_ROOM = 0.52  # bar-span fraction kept free for the value labels
+MONO_CHAR_PT = 5.2  # width of one IBM Plex Mono character at ~8.6pt
 
 
 @dataclass
@@ -63,6 +65,28 @@ def is_dollar_pegged(c: Stablecoin) -> bool:
     if c.peg_type != "peggedUSD" or c.price is None or c.yield_bearing:
         return False
     return c.price <= 1.03  # >3% above $1 is a yield token DefiLlama hasn't flagged
+
+
+def _share_label(c: Stablecoin) -> str | None:
+    """The move as a share of the coin's own supply a week ago.
+
+    A coin with no supply last week is not a 0% move, it is a launch, so it says
+    so. More decimals on small moves: USDT's +$170M is +0.1%, not +0%.
+    """
+    if not c.prev_week:
+        return "new" if c.change_7d and c.change_7d > 0 else None
+    pct = c.change_7d / c.prev_week
+    return fmt.pct(pct, digits=1 if abs(pct) < 0.1 else 0)
+
+
+def _resolution_date(market: Market) -> date | None:
+    """When the market settles. Polymarket sends ISO 8601, sometimes with a Z suffix."""
+    if not market.end_date:
+        return None
+    try:
+        return datetime.fromisoformat(market.end_date.replace("Z", "+00:00")).date()
+    except (AttributeError, ValueError):
+        return None
 
 
 def _clear_of(lo: float, hi: float, span: float) -> tuple[float, str]:
@@ -159,6 +183,11 @@ def supply_chart(points: list[SupplyPoint], out: Path, *, days: int = 180,
     pad = (hi - lo) * 0.14 or lo * 0.01
     ax.set_ylim(lo - pad, hi + pad * 2.6)
     ax.set_xlim(xs[0], xs[-1] + timedelta(days=3))
+    # The hero reads "vs 30 days ago"; shade that window so it can be seen, not just read.
+    ax.axvspan(month_ago.day, xs[-1], color=BAND, zorder=0, linewidth=0)
+    ax.annotate("last 30 days", (month_ago.day, 1), xycoords=("data", "axes fraction"),
+                xytext=(4, -9), textcoords="offset points", ha="left", va="top",
+                fontsize=7.8, color=TEXT_3)
     ax.fill_between(xs, ys, lo - pad, color=BRAND, alpha=0.08, linewidth=0)
     ax.plot(xs, ys, color=BRAND, linewidth=LINE_W, solid_capstyle="round", solid_joinstyle="round")
     end_dot(ax, xs[-1], ys[-1], BRAND)
@@ -206,37 +235,51 @@ def movers_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 
     labels = [name[id(c)] for c in picked]
     frame = new_frame(
         "Supply flows · 7 days", headline,
-        "Biggest changes in circulating supply, last 7 days",
+        "Change in circulating supply and share of each coin's float, last 7 days",
         "Data: DefiLlama", _date_label(today),
         hero=fmt.usd(net, sign=True), hero_sub="net, all USD stablecoins",
         sample=sample, plot_left=label_margin(labels), plot_right=0.945,
     )
     ax = frame.ax
     vals = [c.change_7d for c in picked]
+    # Share of the coin's own supply: $683M on a small coin is a very different
+    # week from $1.2B on USDC, and the bar length alone cannot say which.
+    pcts = [_share_label(c) for c in picked]
     ys = list(range(len(picked)))
     span = max(abs(v) for v in vals)
-    ax.set_xlim(-span * 1.38 if min(vals) < 0 else -span * 0.04,
-                span * 1.38 if max(vals) > 0 else span * 0.04)
+    # Room for "+$683M  +14%" past the bar end, and no further.
+    ax.set_xlim(min(vals) - span * LABEL_ROOM if min(vals) < 0 else -span * 0.04,
+                max(vals) + span * LABEL_ROOM if max(vals) > 0 else span * 0.04)
     ax.set_ylim(-0.6, len(picked) - 0.4)
     rounded_hbars(ax, ys, vals, [UP if v >= 0 else DOWN for v in vals])
     ax.axvline(0, color=TEXT_3, linewidth=0.7, zorder=3)
-    for y, v in zip(ys, vals):
-        ax.text(v + (span * 0.025 if v >= 0 else -span * 0.025), y, fmt.usd(v, sign=True),
-                va="center", ha="left" if v >= 0 else "right", fontsize=8.6, color=TEXT)
+    for y, v, pc in zip(ys, vals, pcts):
+        side = 1 if v >= 0 else -1
+        ha = "left" if v >= 0 else "right"
+        amount = fmt.usd(v, sign=True)
+        ax.annotate(amount, (v, y), xytext=(5 * side, 0), textcoords="offset points",
+                    va="center", ha=ha, fontsize=8.6, color=TEXT)
+        if pc:  # mono, so the first label's width is len * char width
+            ax.annotate(pc, (v, y),
+                        xytext=((11 + len(amount) * MONO_CHAR_PT) * side, 0),
+                        textcoords="offset points", va="center", ha=ha,
+                        fontsize=8.2, color=TEXT_3)
 
     ax.set_yticks(ys, labels, fontsize=9, color=TEXT_2)
-    ax.grid(False)
-    ax.grid(axis="x", color=GRID, linewidth=0.6)
-    ax.spines["bottom"].set_visible(False)
-    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: fmt.usd(v, digits=0, sign=v > 0)))
-    legend_loc = "lower right" if vals[0] < 0 else "upper left"
+    ax.grid(False)  # the direct labels already carry every value
+    ax.set_xticks([])
+    for side in ("bottom", "top", "left", "right"):
+        ax.spines[side].set_visible(False)
     ax.legend(handles=[Patch(color=UP, label="Minted"), Patch(color=DOWN, label="Redeemed")],
-              loc=legend_loc, ncol=2, frameon=False, fontsize=8.4, labelcolor=TEXT_2,
-              handlelength=0.9, handleheight=0.9, columnspacing=1.2, borderaxespad=0.3)
+              loc="upper left", bbox_to_anchor=(0, -0.01), ncol=2, frameon=False,
+              fontsize=8.4, labelcolor=TEXT_2, handlelength=0.9, handleheight=0.9,
+              columnspacing=1.2, borderaxespad=0)
 
     image = save(frame.fig, out / "movers.png")
     ranked = sorted(picked, key=lambda c: abs(c.change_7d), reverse=True)[:3]
-    parts = "\n".join(f"{name[id(c)]} {fmt.usd(c.change_7d, sign=True)}" for c in ranked)
+    parts = "\n".join(
+        f"{name[id(c)]} {fmt.usd(c.change_7d, sign=True)}"
+        + (f" ({_share_label(c)})" if _share_label(c) else "") for c in ranked)
     caption = (f"{headline}.\n\nBiggest supply moves, last 7 days:\n{parts}\n\n"
                f"Net across all USD stablecoins: {fmt.usd(net, sign=True)}.\n\nData: DefiLlama")
     alt = "Bar chart of 7-day stablecoin supply change: " + "; ".join(
@@ -400,9 +443,12 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
 
     today = history[-1].at.date()
     span_days = max(1, round((history[-1].at - history[0].at).total_seconds() / 86400))
+    resolves = _resolution_date(market)
+    resolves_note = f" · resolves {_short_date(resolves)}" if resolves else ""
     frame = new_frame(
         "Polymarket odds", market.question,
-        f"Chance of Yes, last {span_days} days · {fmt.usd(market.volume_24h)} traded in 24h",
+        f"Chance of Yes, last {span_days} days · "
+        f"{fmt.usd(market.volume_24h)} traded in 24h{resolves_note}",
         "Data: Polymarket", _date_label(today),
         hero=f"{now:.0f}%",
         hero_sub=(f"{span_move:+.0f} pts in {span_days} days"
@@ -426,7 +472,9 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
     ax.yaxis.tick_right()
     ax.yaxis.set_major_locator(MultipleLocator(25))
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
-    ax.xaxis.set_major_locator(mdates.DayLocator(interval=7))
+    step = 7 if span_days <= 45 else 14
+    ticks = [xs[-1] - timedelta(days=d) for d in range(0, span_days + 1, step)][::-1]
+    ax.set_xticks([t for t in ticks if t >= xs[0]])
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
 
     image = save(frame.fig, out / "odds.png")
@@ -435,8 +483,10 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
         context = f", {'up' if span_move > 0 else 'down'} {abs(span_move):.0f} pts over {span_days} days"
         if peak.price * 100 - now >= 10:
             context += f" (it peaked at {peak.price * 100:.0f}% on {_short_date(peak.at.date())})"
+    settles = f" Market resolves {_short_date(resolves)}." if resolves else ""
     caption = (f"Polymarket: {market.question}\n\nYes is at {now:.0f}%, {trend}{context}. "
-               f"{fmt.usd(market.volume_24h)} traded in the last 24 hours.\n\nData: Polymarket")
+               f"{fmt.usd(market.volume_24h)} traded in the last 24 hours.{settles}"
+               f"\n\nData: Polymarket")
     alt = (f"Line chart of Polymarket odds for '{market.question}' over {span_days} days, "
            f"now {now:.0f}%, {trend}.")
     return Post("odds", image, market.question, _caption(caption, sample), alt)

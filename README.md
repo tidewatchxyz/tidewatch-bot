@@ -7,9 +7,9 @@ Every run makes four 1600x900 PNGs, each with a draft caption and alt text:
 | Chart | What it shows | Source |
 |---|---|---|
 | `supply.png` | Total stablecoin supply, last 180 days, with the 30-day change | DefiLlama |
-| `movers.png` | Biggest 7-day mints and redemptions, plus the net across all USD stablecoins | DefiLlama |
+| `movers.png` | Biggest 7-day mints and redemptions, each as a share of that coin's own float, plus the net | DefiLlama |
 | `pegs.png` | Price today plus the 30-day range vs $1 for the 10 largest USD stablecoins, flagging anything more than 50 bps off | DefiLlama |
-| `odds.png` | 30-day Yes odds for one Polymarket market (the most traded one, or one you pick) | Polymarket |
+| `odds.png` | 30-day Yes odds for one Polymarket market, with its resolution date | Polymarket |
 
 Both APIs are free and need no key.
 
@@ -71,6 +71,12 @@ Dark surface `#0D1117`, brand mint `#3DDC97` for single lines, Archivo Black tit
 The peg chart scales to the day's data rather than a fixed ±100 bps, with a floor of ±15 bps
 so ordinary noise never gets magnified into news. The ±50 bps band is drawn only when it fits
 on that scale.
+
+Charts carry their values as direct labels and drop the axis that would repeat them, so the
+movers chart has no x-axis at all. A move is shown in dollars and as a share of that coin's
+own supply, because $1.2B out of USDC is 1.6% of it while a $683M launch is all of it. The
+mint/orange pair is checked with a CVD validator against the dark surface (worst adjacent
+deutan ΔE 8.8, above the 8 threshold).
 
 Fonts are bundled under the SIL Open Font License (see `tidewatch/fonts/`).
 
