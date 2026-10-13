@@ -223,6 +223,31 @@ class PegChartTests(unittest.TestCase):
         self.assertFalse(plt.rcParams["text.parse_math"])
 
 
+class ShareLabelTests(unittest.TestCase):
+    @staticmethod
+    def _coin(circ, prev_week):
+        return defillama.Stablecoin(name="x", symbol="X", peg_type="peggedUSD", mechanism="",
+                                    circulating=circ, prev_day=None, prev_week=prev_week,
+                                    prev_month=None, price=1.0)
+
+    def test_percent_for_ordinary_moves(self):
+        self.assertEqual(charts._share_label(self._coin(1.14e9, 1e9)), "+14%")
+
+    def test_extra_decimal_when_tiny(self):
+        """USDT's +$170M is +0.1%, and rounding it to +0% throws the number away."""
+        self.assertEqual(charts._share_label(self._coin(184.09e9, 183.92e9)), "+0.1%")
+
+    def test_launch_reads_as_new(self):
+        self.assertEqual(charts._share_label(self._coin(683e6, 0.0)), "new")
+
+    def test_near_launch_shows_a_multiple_not_a_huge_percent(self):
+        """USPD went from $360K to $99M: '+27560%' is arithmetic, not information."""
+        self.assertEqual(charts._share_label(self._coin(99.36e6, 0.36e6)), "\u00d7276")
+
+    def test_no_label_without_history(self):
+        self.assertIsNone(charts._share_label(self._coin(1e9, None)))
+
+
 class ChartSmokeTests(unittest.TestCase):
     def test_all_charts_render(self):
         coins = defillama.parse_stablecoins(sample.stablecoins_raw())

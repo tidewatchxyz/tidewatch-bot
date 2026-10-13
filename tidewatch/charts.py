@@ -25,6 +25,7 @@ PEG_BAND_BPS = 50
 MIN_PEG_SPAN_BPS = 15.0  # never zoom in tighter than this, or noise looks like news
 LABEL_ROOM = 0.52  # bar-span fraction kept free for the value labels
 MONO_CHAR_PT = 5.2  # width of one IBM Plex Mono character at ~8.6pt
+BIG_GROWTH = 10.0  # past +1000%, show a multiple instead of a percent
 
 
 @dataclass
@@ -76,6 +77,8 @@ def _share_label(c: Stablecoin) -> str | None:
     if not c.prev_week:
         return "new" if c.change_7d and c.change_7d > 0 else None
     pct = c.change_7d / c.prev_week
+    if pct >= BIG_GROWTH:  # "+27560%" is arithmetic, not information
+        return f"\u00d7{1 + pct:.0f}"
     return fmt.pct(pct, digits=1 if abs(pct) < 0.1 else 0)
 
 
