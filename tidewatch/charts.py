@@ -68,6 +68,16 @@ def is_dollar_pegged(c: Stablecoin) -> bool:
     return c.price <= 1.03  # >3% above $1 is a yield token DefiLlama hasn't flagged
 
 
+def _looks_frozen(c: Stablecoin) -> bool:
+    """DefiLlama sometimes stops updating a coin and keeps serving one stale snapshot.
+
+    USPD sat at "+$99M this week" for seven straight days: same supply, same
+    "a day ago", no price. An unpriced coin claiming more than 10x growth in a
+    single day is that failure, and it would otherwise lead the movers chart.
+    """
+    return c.price is None and bool(c.prev_day) and c.circulating > c.prev_day * 10
+
+
 def _share_label(c: Stablecoin) -> str | None:
     """The move as a share of the coin's own supply a week ago.
 
@@ -224,7 +234,7 @@ def supply_chart(points: list[SupplyPoint], out: Path, *, days: int = 180,
 def movers_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 8,
                  min_size: float = 50e6, sample: bool = False) -> Post:
     usd = [c for c in coins if c.peg_type == "peggedUSD" and c.change_7d is not None
-           and c.circulating >= min_size]
+           and c.circulating >= min_size and not _looks_frozen(c)]
     picked = sorted(usd, key=lambda c: abs(c.change_7d), reverse=True)[:top]
     if not picked:
         raise ValueError("No stablecoins with 7-day history")

@@ -248,6 +248,37 @@ class ShareLabelTests(unittest.TestCase):
         self.assertIsNone(charts._share_label(self._coin(1e9, None)))
 
 
+class FrozenCoinTests(unittest.TestCase):
+    @staticmethod
+    def _coin(circ, prev_day, price):
+        return defillama.Stablecoin(name="x", symbol="X", peg_type="peggedUSD", mechanism="",
+                                    circulating=circ, prev_day=prev_day, prev_week=0.358e6,
+                                    prev_month=None, price=price)
+
+    def test_unpriced_overnight_200x_is_frozen(self):
+        """USPD: $0.48M "a day ago", $98.9M now, no price, unchanged for a week."""
+        self.assertTrue(charts._looks_frozen(self._coin(98.9e6, 0.48e6, None)))
+
+    def test_priced_launch_is_kept(self):
+        self.assertFalse(charts._looks_frozen(self._coin(98.9e6, 0.48e6, 1.0)))
+
+    def test_unpriced_but_steady_is_kept(self):
+        """M, USDB, SUSD have no price on DefiLlama but move normally."""
+        self.assertFalse(charts._looks_frozen(self._coin(207.8e6, 208.4e6, None)))
+
+    def test_frozen_coin_left_out_of_movers_and_net(self):
+        raw = sample.stablecoins_raw()
+        raw["peggedAssets"].append({
+            "name": "Frozen Dollar", "symbol": "FRZ", "pegType": "peggedUSD",
+            "circulating": {"peggedUSD": 5e9}, "circulatingPrevDay": {"peggedUSD": 1e6},
+            "circulatingPrevWeek": {"peggedUSD": 1e6}})
+        coins = defillama.parse_stablecoins(raw)
+        with tempfile.TemporaryDirectory() as d:
+            post = charts.movers_chart(coins, Path(d), date(2026, 10, 19))
+        self.assertNotIn("FRZ", post.alt_text)
+        self.assertNotIn("Frozen", post.headline)
+
+
 class ChartSmokeTests(unittest.TestCase):
     def test_all_charts_render(self):
         coins = defillama.parse_stablecoins(sample.stablecoins_raw())
