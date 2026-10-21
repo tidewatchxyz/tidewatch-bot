@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable
 
 from .http import Fetcher
@@ -41,6 +42,7 @@ class Stablecoin:
 class SupplyPoint:
     day: date
     total_usd: float
+    pegged_usd: float = 0.0  # dollar-pegged coins only; total_usd also counts EUR, gold...
 
 
 def _peg_amount(block: Any, peg_type: str) -> float | None:
@@ -88,7 +90,9 @@ def parse_supply_chart(raw: list) -> list[SupplyPoint]:
         total = sum(v for v in usd.values() if isinstance(v, (int, float)))
         if total > 0:
             day = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-            points.append(SupplyPoint(day=day, total_usd=total))
+            pegged = usd.get("peggedUSD")
+            points.append(SupplyPoint(day=day, total_usd=total,
+                                      pegged_usd=float(pegged) if isinstance(pegged, (int, float)) else 0.0))
     points.sort(key=lambda p: p.day)
     return points
 
@@ -163,3 +167,84 @@ def parse_peg_ranges(raw: Any, gecko_ids: Iterable[str], *,
 def fetch_price_history(fetcher: Fetcher, *, days: int = PEG_WINDOW_DAYS) -> list:
     return fetcher.get_json(f"{BASE}/stablecoinprices", name="defillama_stablecoin_prices",
                             trim=lambda raw: trim_price_history(raw, days=days))
+
+
+# Supply by chain and per coin ----------------------------------------------------
+
+CHAIN_WINDOW_DAYS = 30
+SHARE_WINDOW_DAYS = 180
+USDT_ID, USDC_ID = 1, 2  # DefiLlama stablecoin ids
+
+
+@dataclass(frozen=True)
+class ChainSupply:
+    name: str
+    now: float          # USD-pegged stablecoins on the chain today
+    before: float       # the same, CHAIN_WINDOW_DAYS ago
+
+    @property
+    def change(self) -> float:
+        return self.now - self.before
+
+    @property
+    def change_pct(self) -> float:
+        return self.change / self.before if self.before else 0.0
+
+
+def _trim_rows(raw: Any, keep: int) -> Any:
+    """Trailing daily rows of a /stablecoincharts response, kept whole."""
+    if not isinstance(raw, list):
+        return raw
+    return sorted((r for r in raw if isinstance(r, dict)), key=_row_ts)[-keep:]
+
+
+def parse_chain_list(raw: Any, top: int) -> list[tuple[str, float]]:
+    """The `top` chains by USD-pegged supply, from /stablecoinchains."""
+    rows = []
+    for c in raw if isinstance(raw, list) else []:
+        amount = _peg_amount(c.get("totalCirculatingUSD"), "peggedUSD") if isinstance(c, dict) else None
+        if amount and c.get("name"):
+            rows.append((str(c["name"]), amount))
+    rows.sort(key=lambda t: t[1], reverse=True)
+    return rows[:top]
+
+
+def parse_pegged_history(raw: Any) -> list[tuple[date, float]]:
+    """(day, USD-pegged supply) rows from any /stablecoincharts response."""
+    out = []
+    for r in raw if isinstance(raw, list) else []:
+        amount = _peg_amount(r.get("totalCirculatingUSD"), "peggedUSD") if isinstance(r, dict) else None
+        ts = _row_ts(r)
+        if amount and ts:
+            out.append((datetime.fromtimestamp(ts, tz=timezone.utc).date(), amount))
+    out.sort()
+    return out
+
+
+def chain_supply(name: str, history: list[tuple[date, float]],
+                 days: int = CHAIN_WINDOW_DAYS) -> ChainSupply | None:
+    if len(history) < 2:
+        return None
+    last_day, now = history[-1]
+    before = next((v for d, v in reversed(history) if (last_day - d).days >= days), history[0][1])
+    return ChainSupply(name=name, now=now, before=before)
+
+
+def fetch_chains(fetcher: Fetcher, *, top: int = 8, days: int = CHAIN_WINDOW_DAYS) -> list[ChainSupply]:
+    raw = fetcher.get_json(f"{BASE}/stablecoinchains", name="defillama_stablecoin_chains")
+
+    def one(name: str) -> ChainSupply | None:
+        hist = fetcher.get_json(f"{BASE}/stablecoincharts/{name}", name=f"defillama_chain_{name}",
+                                trim=lambda r: _trim_rows(r, days + 10))
+        return chain_supply(name, parse_pegged_history(hist), days)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        found = list(pool.map(one, [name for name, _ in parse_chain_list(raw, top)]))
+    return [c for c in found if c]
+
+
+def fetch_coin_history(fetcher: Fetcher, coin_id: int, *,
+                       days: int = SHARE_WINDOW_DAYS) -> list[tuple[date, float]]:
+    raw = fetcher.get_json(f"{BASE}/stablecoincharts/all", {"stablecoin": coin_id},
+                           name=f"defillama_coin_{coin_id}", trim=lambda r: _trim_rows(r, days + 10))
+    return parse_pegged_history(raw)

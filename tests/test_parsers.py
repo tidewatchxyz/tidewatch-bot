@@ -279,12 +279,105 @@ class FrozenCoinTests(unittest.TestCase):
         self.assertNotIn("Frozen", post.headline)
 
 
+class SwingAndFedTests(unittest.TestCase):
+    @staticmethod
+    def _m(q, p, wk, vol=500e3, event="", group="", sports=False, end="2099-01-01T00:00:00Z"):
+        return polymarket.Market(q, q, ["Yes", "No"], [p, 1 - p], ["1", "2"], vol / 5, end,
+                                 volume_1wk=vol, is_sports=sports, one_week_change=wk,
+                                 event_id=event, event_title="", group_title=group)
+
+    def test_swings_keep_liquid_crypto_and_macro_only(self):
+        ms = [self._m("Will Bitcoin reach $150k in 2026?", 0.24, -0.27),
+              self._m("Will Bitcoin dip to $60k in 2026?", 0.30, 0.05),
+              self._m("Will Bitcoin hit $1M?", 0.01, -0.02),                   # nearly settled
+              self._m("Will Ethereum reach $5k?", 0.40, 0.30, vol=10e3),       # too thin
+              self._m("Chiefs vs. Bills: will the Chiefs win?", 0.5, 0.4),     # a game
+              self._m("Will Taylor Swift tour Asia?", 0.5, 0.4),               # off topic
+              self._m("Bitcoin Up or Down on October 20?", 0.5, 0.45)]          # daily coin flip
+        got = [m.question for m in polymarket.swing_candidates(ms)]
+        self.assertEqual(got, ["Will Bitcoin reach $150k in 2026?", "Will Bitcoin dip to $60k in 2026?"])
+
+    def test_swings_one_market_per_event(self):
+        ms = [self._m("Will Bitcoin reach $100k in October?", 0.3, -0.05, event="btc-oct"),
+              self._m("Will Bitcoin dip to $70k in October?", 0.2, -0.15, event="btc-oct")]
+        got = polymarket.swing_candidates(ms)
+        self.assertEqual([m.question for m in got], ["Will Bitcoin dip to $70k in October?"])
+
+    def test_fed_buckets_and_week_ago(self):
+        q = "Will {} after the October 2026 meeting?"
+        meeting = [self._m(q.format("the Fed increase interest rates by 25 bps"), 0.12, -0.07, event="f",
+                           group="25 bps increase"),
+                   self._m(q.format("there be no change in Fed interest rates"), 0.88, 0.07, event="f",
+                           group="No change"),
+                   self._m(q.format("the Fed decrease interest rates by 25 bps"), 0.004, None, event="f",
+                           group="25 bps decrease")]
+        now, before = charts.fed_odds(meeting)
+        self.assertAlmostEqual(sum(now.values()), 1.0)
+        self.assertGreater(now["hold"], before["hold"])
+        self.assertAlmostEqual(sum(before.values()), 1.0)
+        self.assertAlmostEqual(before["hike"], 0.19 / 1.004, places=4)  # 0.12 + 0.07, renormalised
+        self.assertEqual(polymarket.fed_month(meeting), "October")
+
+    def test_fed_meeting_skips_resolved_and_picks_nearest(self):
+        q = "Will there be no change in Fed interest rates after the {} 2026 meeting?"
+        past = self._m(q.format("September"), 0.5, 0.0, event="sep", end="2020-01-01T00:00:00Z")
+        oct_ = [self._m(q.format("October"), 0.8, 0.0, event="oct", end="2099-10-29T00:00:00Z"),
+                self._m(q.replace("there be no change in Fed", "the Fed increase").format("October"),
+                        0.2, 0.0, event="oct", end="2099-10-29T00:00:00Z")]
+        dec = [self._m(q.format("December"), 0.6, 0.0, event="dec", end="2099-12-10T00:00:00Z"),
+               self._m(q.format("December"), 0.4, 0.0, event="dec", end="2099-12-10T00:00:00Z")]
+        got = polymarket.fed_meeting([past, *dec, *oct_])
+        self.assertEqual({m.event_id for m in got}, {"oct"})
+
+    def test_short_row_labels(self):
+        self.assertEqual(charts._label_question(
+            "Will there be no change in Fed interest rates after the October 2026 meeting?"),
+            "No change in Fed rates after the October 2026 meeting")
+        self.assertEqual(charts._label_question("Will Bitcoin dip to $77,500 in October?"),
+                         "Bitcoin dip to $77,500 in October")
+
+
+class ChainAndShareTests(unittest.TestCase):
+    def test_chain_change_over_window(self):
+        hist = [(date(2026, 9, d), 100e9) for d in range(1, 30)] + [(date(2026, 10, 21), 103e9)]
+        cs = defillama.chain_supply("Tron", hist, days=30)
+        self.assertAlmostEqual(cs.change, 3e9)
+        self.assertAlmostEqual(cs.change_pct, 0.03)
+
+    def test_pegged_history_reads_only_dollar_pegs(self):
+        rows = [{"date": "1700000000", "totalCirculatingUSD": {"peggedUSD": 5.0, "peggedEUR": 99.0}},
+                {"date": "1700086400", "totalCirculatingUSD": {"peggedEUR": 1.0}}]
+        self.assertEqual([v for _, v in defillama.parse_pegged_history(rows)], [5.0])
+
+    def test_supply_points_keep_the_dollar_part(self):
+        p = defillama.parse_supply_chart(sample.supply_chart_raw(days=40))[-1]
+        self.assertAlmostEqual(p.pegged_usd / p.total_usd, 0.985, places=6)
+
+
+class RankingTests(unittest.TestCase):
+    def test_score_scales_to_each_charts_notable_bar(self):
+        self.assertEqual(charts.story_score(2e9, charts.NOTABLE["movers"]), 50.0)
+        self.assertEqual(charts.story_score(-4e9, charts.NOTABLE["movers"]), 100.0)
+        self.assertEqual(charts.story_score(99, 1), 100.0)  # capped
+
+    def test_depeg_beats_everything_and_ties_follow_priority(self):
+        from tidewatch.__main__ import rank
+        P = lambda n, s: charts.Post(n, Path(n), n, "", "", s, "")
+        ranked = rank([P("movers", 100), P("pegs", 100), P("share", 40), P("fed", 40)])
+        self.assertEqual([p.name for p in ranked], ["pegs", "movers", "fed", "share"])
+
+
 class ChartSmokeTests(unittest.TestCase):
     def test_all_charts_render(self):
         coins = defillama.parse_stablecoins(sample.stablecoins_raw())
         points = defillama.parse_supply_chart(sample.supply_chart_raw())
         market = polymarket.parse_market(sample.markets_raw()[0])
         history = polymarket.parse_history(sample.history_raw())
+        markets = polymarket.parse_events(sample.topic_events_raw())
+        chains = [defillama.chain_supply(n, defillama.parse_pegged_history(sample.chain_history_raw(n)))
+                  for n, _ in defillama.parse_chain_list(sample.chain_list_raw(), 8)]
+        usdt = defillama.parse_pegged_history(sample.coin_history_raw(defillama.USDT_ID))
+        usdc = defillama.parse_pegged_history(sample.coin_history_raw(defillama.USDC_ID))
         with tempfile.TemporaryDirectory() as d:
             out = Path(d)
             today = points[-1].day
@@ -294,11 +387,24 @@ class ChartSmokeTests(unittest.TestCase):
                 charts.peg_chart(coins, out, today, sample=True, ranges=defillama.parse_peg_ranges(
                     sample.price_history_raw(), [c.gecko_id for c in coins])),
                 charts.odds_chart(market, history, out, sample=True),
+                charts.chains_chart(chains, out, today, sample=True),
+                charts.share_chart(points, usdt, usdc, out, sample=True),
+                charts.swings_chart(polymarket.swing_candidates(markets), out, today, sample=True),
+                charts.fed_chart(polymarket.fed_meeting(markets), out, today, sample=True),
             ]
             for p in posts:
-                self.assertTrue(p.image.exists())
-                self.assertTrue(p.caption.startswith("[SAMPLE DATA"))
-                self.assertLessEqual(len(p.caption), 280 + 27)  # 27 = sample prefix
+                self.assertTrue(p.image.exists(), p.name)
+                self.assertTrue(p.caption.startswith("[SAMPLE DATA"), p.name)
+                self.assertLessEqual(len(p.caption), 280 + 27, p.name)  # 27 = sample prefix
+                self.assertTrue(0 <= p.score <= 100, p.name)
+                self.assertTrue(p.why, p.name)
+
+    def test_quiet_week_is_a_skip_not_a_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(charts.NoStory):
+                charts.swings_chart([], Path(d), date(2026, 10, 21))
+            with self.assertRaises(charts.NoStory):
+                charts.fed_chart([], Path(d), date(2026, 10, 21))
 
 
 if __name__ == "__main__":

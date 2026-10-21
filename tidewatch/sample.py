@@ -89,3 +89,68 @@ def history_raw(seed: int = 7) -> dict:
         p = min(max(p, 0.03), 0.97)
         rows.append({"t": int(t.timestamp()), "p": round(p, 3)})
     return {"history": rows}
+
+
+def chain_list_raw() -> list:
+    sizes = [140e9, 92e9, 16e9, 14e9, 7e9, 5e9, 3.6e9, 3e9]
+    return [{"name": f"Demo Chain {chr(65 + i)}", "totalCirculatingUSD": {"peggedUSD": s}}
+            for i, s in enumerate(sizes)]
+
+
+def _pegged_rows(level: float, days: int, drift: float, seed: int) -> list:
+    rng = random.Random(seed)
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    start -= timedelta(days=days - 1)
+    rows, v = [], level * (1 - drift)
+    for d in range(days):
+        v *= 1 + drift / days + rng.gauss(0, 0.0015)
+        rows.append({"date": str(int((start + timedelta(days=d)).timestamp())),
+                     "totalCirculatingUSD": {"peggedUSD": v}})
+    return rows
+
+
+def chain_history_raw(name: str, days: int = 40) -> list:
+    sizes = {c["name"]: c["totalCirculatingUSD"]["peggedUSD"] for c in chain_list_raw()}
+    i = ord(name[-1]) - 65
+    return _pegged_rows(sizes.get(name, 1e9), days, [-0.012, 0.015, 0.02, -0.006, -0.035, 0.018,
+                                                     -0.045, -0.03][i % 8], seed=40 + i)
+
+
+def coin_history_raw(coin_id: int, days: int = 410) -> list:
+    """USDT-like (1) and USDC-like (2) supply, sized against supply_chart_raw."""
+    total = {r["date"]: sum(r["totalCirculatingUSD"].values()) * 0.985
+             for r in supply_chart_raw(days=days)}
+    share = {1: (0.60, 0.0002), 2: (0.25, -0.0004)}.get(coin_id, (0.05, 0.0))
+    rng = random.Random(70 + coin_id)
+    rows, s = [], share[0]
+    for ts, t in total.items():
+        s = max(0.01, s + share[1] / 10 + rng.gauss(0, 0.0004))
+        rows.append({"date": ts, "totalCirculatingUSD": {"peggedUSD": t * s}})
+    return rows
+
+
+def topic_events_raw() -> list:
+    """Polymarket /events shape: a few crypto markets that moved, plus a Fed meeting."""
+    end = (datetime.now(timezone.utc) + timedelta(days=40)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def mk(q, p, wk, vol, group=""):
+        return {"question": q, "slug": q.lower().replace(" ", "-")[:60], "outcomes": '["Yes", "No"]',
+                "outcomePrices": f'["{p}", "{round(1 - p, 4)}"]', "clobTokenIds": '["1", "2"]',
+                "volume24hr": vol / 5, "volume1wk": vol, "oneWeekPriceChange": wk,
+                "oneDayPriceChange": wk / 3, "endDate": end, "groupItemTitle": group}
+
+    crypto = [mk("Demo: Will Bitcoin reach $150,000 by December 31?", 0.24, -0.27, 2.1e6),
+              mk("Demo: Will Ethereum dip to $1,500 by December 31?", 0.31, 0.12, 900e3),
+              mk("Demo: Will Solana reach $400 in 2026?", 0.12, -0.08, 400e3),
+              mk("Demo: Will a spot XRP ETF launch this year?", 0.58, 0.06, 650e3)]
+    fed = [mk("Demo: Will the Fed increase interest rates by 25 bps after the December 2026 meeting?",
+              0.22, 0.09, 3e6, "25 bps increase"),
+           mk("Demo: Will there be no change in Fed interest rates after the December 2026 meeting?",
+              0.74, -0.08, 4e6, "No change"),
+           mk("Demo: Will the Fed decrease interest rates by 25 bps after the December 2026 meeting?",
+              0.04, -0.01, 1e6, "25 bps decrease")]
+    events = [{"id": f"demo-{i}", "title": m["question"], "slug": f"demo-{i}", "markets": [m]}
+              for i, m in enumerate(crypto)]
+    events.append({"id": "demo-fed", "title": "Demo: Fed Decision in December?", "slug": "demo-fed",
+                   "markets": fed})
+    return events

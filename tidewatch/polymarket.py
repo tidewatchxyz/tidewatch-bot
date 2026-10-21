@@ -31,6 +31,11 @@ class Market:
     end_date: str | None
     volume_1wk: float = 0.0
     is_sports: bool = False
+    one_day_change: float | None = None   # Yes price change, 0..1 scale
+    one_week_change: float | None = None
+    event_id: str = ""
+    event_title: str = ""
+    group_title: str = ""                 # outcome label inside a multi-market event
 
     @property
     def is_binary_yes_no(self) -> bool:
@@ -77,6 +82,15 @@ def parse_market(m: dict) -> Market | None:
                 continue
         return 0.0
 
+    def change(key: str) -> float | None:
+        try:
+            return None if m.get(key) is None else float(m[key])
+        except (TypeError, ValueError):
+            return None
+
+    events = m.get("events") if isinstance(m.get("events"), list) else []
+    event = events[0] if events and isinstance(events[0], dict) else {}
+
     return Market(
         question=m["question"].strip(),
         slug=m.get("slug", ""),
@@ -87,6 +101,11 @@ def parse_market(m: dict) -> Market | None:
         end_date=m.get("endDate"),
         volume_1wk=num("volume1wk", "volume1wkClob"),
         is_sports=bool(m.get("sportsMarketType") or m.get("gameStartTime")),
+        one_day_change=change("oneDayPriceChange"),
+        one_week_change=change("oneWeekPriceChange"),
+        event_id=str(event.get("id") or ""),
+        event_title=str(event.get("title") or ""),
+        group_title=str(m.get("groupItemTitle") or ""),
     )
 
 
@@ -134,6 +153,62 @@ def pick_market(markets: list[Market], now: datetime | None = None) -> Market | 
     return max(ok, key=score, default=None)
 
 
+# Markets whose odds can be read as news rather than a scoreboard.
+_NOT_NEWS = re.compile(r"\bup or down\b|\bO/U\b|\bvs\.?\b|\bwin on \d{4}-|\bleading at halftime\b",
+                       re.I)
+
+
+def swing_candidates(markets: list[Market], *, min_week_volume: float = 250e3) -> list[Market]:
+    """Crypto and macro markets whose weekly odds move means something.
+
+    Sports, daily up/down markets, anything thin, and anything already within 4
+    points of settling are left out: a game ending at 100% is a result, not a swing.
+    One market per event, the one that moved most, so a single Fed meeting cannot
+    fill the chart with its five outcomes.
+    """
+    best: dict[str, Market] = {}
+    for m in markets:
+        p = m.yes_price
+        if (p is None or m.one_week_change is None or m.is_sports
+                or not CRYPTO_MACRO.search(m.question) or _NOT_NEWS.search(m.question)
+                or not 0.04 <= p <= 0.96 or (m.volume_1wk or 0) < min_week_volume):
+            continue
+        key = m.event_id or m.slug
+        if key not in best or abs(m.one_week_change) > abs(best[key].one_week_change or 0):
+            best[key] = m
+    return sorted(best.values(), key=lambda m: abs(m.one_week_change or 0), reverse=True)
+
+
+_FED_EVENT = re.compile(r"\bfed decision\b", re.I)
+_FED_MONTH = re.compile(r"after the (\w+) \d{4} meeting", re.I)
+
+
+def fed_meeting(markets: list[Market], now: datetime | None = None) -> list[Market]:
+    """All outcome markets for the next Fed meeting Polymarket is still trading."""
+    now = now or datetime.now(timezone.utc)
+    events: dict[str, list[Market]] = {}
+    for m in markets:
+        if m.yes_price is None or not m.event_id:
+            continue
+        if _FED_EVENT.search(m.event_title) or (_FED_MONTH.search(m.question) and "Fed" in m.question):
+            events.setdefault(m.event_id, []).append(m)
+    live = [(min((_end(m) for m in ms if _end(m)), default=None), ms)
+            for ms in events.values() if len(ms) >= 2]
+    live = [(end, ms) for end, ms in live if end is None or end > now]
+    if not live:
+        return []
+    live.sort(key=lambda t: t[0] or datetime.max.replace(tzinfo=timezone.utc))
+    return live[0][1]
+
+
+def fed_month(markets: list[Market]) -> str | None:
+    for m in markets:
+        hit = _FED_MONTH.search(m.question)
+        if hit:
+            return hit.group(1).capitalize()
+    return None
+
+
 def fetch_top_markets(fetcher: Fetcher, limit: int = 100) -> list[Market]:
     raw = fetcher.get_json(
         f"{GAMMA}/markets",
@@ -146,6 +221,68 @@ def fetch_top_markets(fetcher: Fetcher, limit: int = 100) -> list[Market]:
     # Sort locally too, in case the API ignores the order parameter.
     found.sort(key=lambda m: m.volume_24h, reverse=True)
     return found
+
+
+TOPIC_TAGS = ("crypto", "economy")
+_KEEP_WEEK_VOLUME = 20e3
+
+
+def trim_events(raw: Any) -> list:
+    """Keep only markets that traded in the last week. Each topic feed is 2 to 4 MB,
+    nearly all of it dormant strike ladders; market objects are kept whole."""
+    out = []
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict):
+            continue
+        live = []
+        for m in e.get("markets") or []:
+            try:
+                if float(m.get("volume1wk") or 0) >= _KEEP_WEEK_VOLUME:
+                    live.append(m)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if live:
+            out.append({**e, "markets": live})
+    return out
+
+
+def parse_events(raw: Any) -> list[Market]:
+    """Markets from an /events response. Event fields are copied onto each market,
+    which is how /markets reports them too."""
+    found = []
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict):
+            continue
+        ref = {"id": e.get("id"), "title": e.get("title"), "slug": e.get("slug")}
+        for m in e.get("markets") or []:
+            if isinstance(m, dict):
+                parsed = parse_market({**m, "events": m.get("events") or [ref]})
+                if parsed is not None:
+                    found.append(parsed)
+    return found
+
+
+def fetch_topic_markets(fetcher: Fetcher, tags: tuple[str, ...] = TOPIC_TAGS) -> list[Market]:
+    """Liquid markets under Polymarket's topic tags. The plain top-volume list is
+    mostly sports, so crypto and macro questions rarely make it in."""
+    found: dict[str, Market] = {}
+    for tag in tags:
+        raw = fetcher.get_json(
+            f"{GAMMA}/events",
+            {"tag_slug": tag, "active": "true", "closed": "false", "order": "volume1wk",
+             "ascending": "false", "limit": 50},
+            name=f"polymarket_events_{tag}", trim=trim_events)
+        for m in parse_events(raw):
+            found.setdefault(m.slug or m.question, m)
+    return list(found.values())
+
+
+def merge_markets(*lists: list[Market]) -> list[Market]:
+    seen: dict[str, Market] = {}
+    for ms in lists:
+        for m in ms:
+            seen.setdefault(m.slug or m.question, m)
+    return list(seen.values())
 
 
 def fetch_market(fetcher: Fetcher, slug: str) -> Market:

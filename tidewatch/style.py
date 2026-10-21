@@ -47,6 +47,9 @@ UP = "#1FA874"  # supply minted / positive change
 DOWN = "#D95926"  # supply redeemed / negative change
 NEUTRAL = "#6B7788"  # unremarkable dots
 RANGE = "#36445A"  # the span a value moved over a window, behind its dot
+CONTEXT = "#2C3A4D"  # bars that give size as context while a label carries the story
+CAT_2 = "#4F7BEA"  # third categorical hue; with UP and DOWN it passes the CVD validator
+                   # on BG (worst pair deutan dE 8.8, tritan 6.6)
 WARN = "#C98500"  # status: off peg (always paired with a text label)
 
 WIDTH_IN, HEIGHT_IN, DPI = 6.4, 3.6, 250  # -> 1600 x 900 px

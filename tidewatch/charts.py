@@ -6,20 +6,27 @@ data), backs it with one hero number, and annotates at most one point.
 
 from __future__ import annotations
 
+import re
+import textwrap
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import matplotlib.dates as mdates
+import matplotlib.transforms as mtransforms
 import numpy as np
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter, MaxNLocator, MultipleLocator
 
 from . import fmt
-from .defillama import PEG_WINDOW_DAYS, PegRange, Stablecoin, SupplyPoint
-from .polymarket import Market, PricePoint
-from .style import (BAND, BG, BRAND, DOWN, GRID, LINE_W, NEUTRAL, RANGE, TEXT, TEXT_2, TEXT_3,
-                    UP, WARN, end_dot, label_margin, new_frame, rounded_hbars, save)
+from .defillama import (CHAIN_WINDOW_DAYS, PEG_WINDOW_DAYS, ChainSupply, PegRange,
+                        Stablecoin, SupplyPoint)
+from .polymarket import Market, PricePoint, fed_month
+from .style import (BAND, BG, BRAND, CAT_2, CONTEXT, DOWN, GRID, LINE_W, NEUTRAL, RANGE, TEXT,
+                    TEXT_2, TEXT_3, UP, WARN, end_dot, label_margin, new_frame, rounded_hbars,
+                    save)
+from .style import LEFT as STYLE_LEFT
 
 PEG_BAND_BPS = 50
 MIN_PEG_SPAN_BPS = 15.0  # never zoom in tighter than this, or noise looks like news
@@ -35,6 +42,33 @@ class Post:
     headline: str
     caption: str
     alt_text: str
+    score: float = 0.0  # how strong today's story is, 0-100, comparable across charts
+    why: str = ""       # the number behind the score, for the daily ranking
+
+
+class NoStory(ValueError):
+    """Not enough data for this chart today, e.g. fewer than 3 markets moved.
+    The run reports it as a skip, not a failure."""
+
+
+def story_score(value: float, notable: float, *, boost: float = 1.0) -> float:
+    """50 when a chart's number hits its own 'notable' bar, 100 at twice that.
+
+    Each chart measures something different (dollars, points, bps), so scores are
+    scaled to what counts as news for that chart. The bars are in NOTABLE.
+    """
+    return round(min(100.0, 50.0 * abs(value) / notable * boost), 1)
+
+
+NOTABLE = {  # what a newsworthy day looks like, per chart
+    "supply": 0.02,        # 2% change in 30 days
+    "movers": 2e9,         # $2B net weekly flow across USD stablecoins
+    "odds": 15.0,          # 15-point move in a week
+    "chains": 2e9,         # one chain gaining or losing $2B in 30 days
+    "share": 1.0,          # a 1-point shift in market share over 30 days (a slow number)
+    "swings": 20.0,        # a 20-point weekly swing in a liquid crypto/macro market
+    "fed": 10.0,           # a 10-point weekly shift in the next Fed decision
+}
 
 
 def _date_label(d: date) -> str:
@@ -226,7 +260,9 @@ def supply_chart(points: list[SupplyPoint], out: Path, *, days: int = 180,
     alt = (f"Line chart of total stablecoin supply over the last {days} days, ending at "
            f"{fmt.usd(last.total_usd)} on {_date_label(last.day)}, "
            f"{fmt.usd(change, sign=True)} over 30 days.")
-    return Post("supply", image, headline, _caption(caption, sample), alt)
+    score = 100.0 if is_record else story_score(change_pct, NOTABLE["supply"])
+    why = "new all-time high" if is_record else f"{fmt.pct(change_pct)} in 30 days"
+    return Post("supply", image, headline, _caption(caption, sample), alt, score, why)
 
 
 # 2. Biggest 7-day supply moves -------------------------------------------------
@@ -297,7 +333,8 @@ def movers_chart(coins: list[Stablecoin], out: Path, today: date, *, top: int = 
                f"Net across all USD stablecoins: {fmt.usd(net, sign=True)}.\n\nData: DefiLlama")
     alt = "Bar chart of 7-day stablecoin supply change: " + "; ".join(
         f"{name[id(c)]} {fmt.usd(c.change_7d, sign=True)}" for c in reversed(picked)) + "."
-    return Post("movers", image, headline, _caption(caption, sample), alt)
+    return Post("movers", image, headline, _caption(caption, sample), alt,
+                story_score(net, NOTABLE["movers"]), f"net {fmt.usd(net, sign=True)} this week")
 
 
 # 3. Peg watch ------------------------------------------------------------------
@@ -424,7 +461,13 @@ def peg_chart(coins: list[Stablecoin], out: Path, today: date, *,
     else:
         alt = "Dot plot of each stablecoin's price deviation from $1: " + "; ".join(
             f"{c.symbol} {fmt.bps(d)}" for c, d in zip(usd, devs)) + "."
-    return Post("pegs", image, headline, _caption(caption, sample), alt)
+    if off:  # a depeg is always the day's story
+        score, why = 100.0, f"{len(off)} off peg today"
+    elif strayed:
+        score, why = 60.0, f"{len(strayed)} broke the band this month"
+    else:
+        score, why = 0.0, "all holding"
+    return Post("pegs", image, headline, _caption(caption, sample), alt, score, why)
 
 
 # 4. Prediction market odds --------------------------------------------------------
@@ -502,4 +545,357 @@ def odds_chart(market: Market, history: list[PricePoint], out: Path, *,
                f"\n\nData: Polymarket")
     alt = (f"Line chart of Polymarket odds for '{market.question}' over {span_days} days, "
            f"now {now:.0f}%, {trend}.")
-    return Post("odds", image, market.question, _caption(caption, sample), alt)
+    return Post("odds", image, market.question, _caption(caption, sample), alt,
+                story_score(move, NOTABLE["odds"]), f"{move:+.0f} pts this week")
+
+
+def _marker(ax, x, y, dx_pt: float, up: bool, color: str) -> None:
+    """A small up/down triangle at (x, y) shifted dx_pt points; the bundled fonts
+    have no triangle glyphs, so it is drawn rather than typed."""
+    shift = mtransforms.offset_copy(ax.transData, fig=ax.figure, x=dx_pt, y=0, units="points")
+    ax.plot([x], [y], marker="^" if up else "v", markersize=5.2, color=color,
+            markeredgewidth=0, transform=shift, zorder=4, clip_on=False)
+
+
+def _spread_labels(ax, ys: list[float], min_gap_pt: float = 11.0) -> list[float]:
+    """Nudge end labels apart vertically (in data units) so they never overlap."""
+    if not ys:
+        return ys
+    to_px = lambda v: ax.transData.transform((0, v))[1]
+    from_px = lambda p: ax.transData.inverted().transform((0, p))[1]
+    gap = min_gap_pt * ax.figure.dpi / 72
+    order = sorted(range(len(ys)), key=lambda i: to_px(ys[i]))
+    px = {i: to_px(ys[i]) for i in order}
+    for a, b in zip(order, order[1:]):
+        if px[b] - px[a] < gap:
+            px[b] = px[a] + gap
+    return [from_px(px[i]) for i in range(len(ys))]
+
+
+# 5. Supply by chain --------------------------------------------------------------
+
+def chains_chart(chains: list[ChainSupply], out: Path, today: date, *,
+                 sample: bool = False) -> Post:
+    chains = sorted(chains, key=lambda c: c.now, reverse=True)
+    if len(chains) < 3:
+        raise NoStory("Need supply history for at least 3 chains")
+    days = CHAIN_WINDOW_DAYS
+    gain = max(chains, key=lambda c: c.change)
+    loss = min(chains, key=lambda c: c.change)
+    if gain.change > 0 and loss.change < 0:
+        headline = (f"{gain.name} added {fmt.usd(gain.change)} of stablecoins in {days} days "
+                    f"while {loss.name} lost {fmt.usd(-loss.change)}")
+    elif gain.change > 0:
+        headline = f"Stablecoins grew on every big chain, led by {gain.name} at {fmt.usd(gain.change, sign=True)}"
+    else:
+        headline = f"Stablecoins shrank on every big chain, most on {loss.name} at {fmt.usd(loss.change)}"
+    lead = gain if abs(gain.change) >= abs(loss.change) else loss
+
+    names = [c.name for c in chains]
+    frame = new_frame(
+        "Where the dollars live", headline,
+        f"USD stablecoins on each chain, and the change over the last {days} days",
+        "Data: DefiLlama", _date_label(today),
+        hero=fmt.usd(lead.change, sign=True), hero_sub=f"{lead.name}, {days} days",
+        sample=sample, plot_left=label_margin(names), plot_right=0.945,
+    )
+    ax = frame.ax
+    ys = list(range(len(chains)))[::-1]
+    top = max(c.now for c in chains)
+    ax.set_xlim(0, top * 1.95)  # room for "$94.2B  ^ +$1.3B  +1.4%" past the longest bar
+    ax.set_ylim(-0.6, len(chains) - 0.4)
+    rounded_hbars(ax, ys, [c.now for c in chains], [CONTEXT] * len(chains), height=0.56)
+    for y, c in zip(ys, chains):
+        size = fmt.usd(c.now)
+        ax.annotate(size, (c.now, y), xytext=(6, 0), textcoords="offset points",
+                    va="center", ha="left", fontsize=8.6, color=TEXT)
+        at = 6 + len(size) * MONO_CHAR_PT + 12
+        if abs(c.change_pct) < 0.0005:
+            ax.annotate("flat", (c.now, y), xytext=(at, 0), textcoords="offset points",
+                        va="center", ha="left", fontsize=8.2, color=TEXT_3)
+            continue
+        up = c.change > 0
+        _marker(ax, c.now, y, at + 3, up, UP if up else DOWN)
+        ax.annotate(f"{fmt.usd(c.change, sign=True)}  {fmt.pct(c.change_pct)}", (c.now, y),
+                    xytext=(at + 11, 0), textcoords="offset points", va="center", ha="left",
+                    fontsize=8.2, color=TEXT_2)
+    ax.set_yticks(ys, names, fontsize=9, color=TEXT_2)
+    ax.grid(False)
+    ax.set_xticks([])
+    for side in ("bottom", "top", "left", "right"):
+        ax.spines[side].set_visible(False)
+
+    image = save(frame.fig, out / "chains.png")
+    lines = "\n".join(f"{c.name} {fmt.usd(c.now)} ({fmt.usd(c.change, sign=True)})" for c in chains[:3])
+    caption = (f"{headline}.\n\nStablecoins by chain, {days}-day change:\n{lines}"
+               f"\n\nData: DefiLlama")
+    alt = (f"Bar chart of USD stablecoin supply by chain with the {days}-day change: " + "; ".join(
+        f"{c.name} {fmt.usd(c.now)}, {fmt.usd(c.change, sign=True)} ({fmt.pct(c.change_pct)})"
+        for c in chains) + ".")
+    return Post("chains", image, headline, _caption(caption, sample), alt,
+                story_score(lead.change, NOTABLE["chains"]),
+                f"{lead.name} {fmt.usd(lead.change, sign=True)} in {days} days")
+
+
+# 6. USDT vs USDC share -----------------------------------------------------------
+
+def share_chart(total: list[SupplyPoint], usdt: list[tuple[date, float]],
+                usdc: list[tuple[date, float]], out: Path, *, days: int = 180,
+                sample: bool = False) -> Post:
+    tot = {p.day: p.pegged_usd for p in total if p.pegged_usd > 0}
+    t, c = dict(usdt), dict(usdc)
+    common = sorted(d for d in tot if d in t and d in c)
+    if len(common) < 31:
+        raise NoStory("Need at least 31 days of USDT, USDC and total supply")
+    common = [d for d in common if d > common[-1] - timedelta(days=days)]
+    series = {
+        "USDT": [t[d] / tot[d] * 100 for d in common],
+        "USDC": [c[d] / tot[d] * 100 for d in common],
+        "Others": [100 - (t[d] + c[d]) / tot[d] * 100 for d in common],
+    }
+    colors = {"USDT": UP, "USDC": CAT_2, "Others": DOWN}
+    start, end = common[0], common[-1]
+    month_back = next((i for i, d in enumerate(common) if d >= end - timedelta(days=30)), 0)
+    delta = {k: v[-1] - v[0] for k, v in series.items()}
+    delta_30 = {k: v[-1] - v[month_back] for k, v in series.items()}
+    lead = max(delta, key=lambda k: abs(delta[k]))
+    since = f"since {start:%B}"
+    now, then = series[lead][-1], series[lead][0]
+    verb = "rose" if delta[lead] > 0 else "slipped"
+    if lead == "Others":
+        headline = (f"Smaller stablecoins {'took' if delta[lead] > 0 else 'gave up'} "
+                    f"{abs(delta[lead]):.1f} points of share {'from' if delta[lead] > 0 else 'to'} "
+                    f"USDT and USDC {since}")
+    else:
+        headline = f"{lead}'s share of stablecoins {verb} to {now:.1f}% from {then:.1f}% {since}"
+
+    frame = new_frame(
+        "Market share", headline,
+        f"Change in share of all USD stablecoins since {_short_date(start)}, in percentage points",
+        "Data: DefiLlama", _date_label(end),
+        hero=f"{now:.1f}%", hero_sub=f"{lead.lower() if lead == 'Others' else lead}, was {then:.1f}%",
+        sample=sample, plot_left=0.105, plot_right=0.755,
+    )
+    ax = frame.ax
+    lo = min(min(v[i] - v[0] for i in range(len(v))) for v in series.values())
+    hi = max(max(v[i] - v[0] for i in range(len(v))) for v in series.values())
+    pad = max(0.15, (hi - lo) * 0.12)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_xlim(common[0], common[-1])
+    ax.axhline(0, color=TEXT_3, linewidth=0.7, zorder=1)
+    ends = []
+    for k, v in series.items():
+        ys = [x - v[0] for x in v]
+        ax.plot(common, ys, color=colors[k], linewidth=LINE_W, solid_joinstyle="round",
+                solid_capstyle="round", zorder=3)
+        end_dot(ax, common[-1], ys[-1], colors[k])
+        ends.append((k, ys[-1]))
+    placed = _spread_labels(ax, [e[1] for e in ends])
+    for (k, yv), yl in zip(ends, placed):
+        ax.annotate(f"{k} {series[k][-1]:.1f}% {delta[k]:+.1f}", (common[-1], yl),
+                    xytext=(10, 0), textcoords="offset points", va="center", ha="left",
+                    fontsize=8.4, color=TEXT, annotation_clip=False)
+    ax.yaxis.tick_left()
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:+.1f}" if v else "0"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax.legend(handles=[Line2D([0], [0], color=colors[k], linewidth=LINE_W, label=k) for k in series],
+              loc="upper left", ncol=3, frameon=False, fontsize=8, labelcolor=TEXT_2,
+              handlelength=1.4, columnspacing=1.4, borderaxespad=0.2)
+
+    image = save(frame.fig, out / "share.png")
+    rows = "\n".join(f"{k} {series[k][-1]:.1f}% ({delta[k]:+.1f} pts)" for k in series)
+    caption = (f"{headline}.\n\nShare of all USD stablecoins, change since {_short_date(start)}:\n"
+               f"{rows}\n\nData: DefiLlama")
+    alt = (f"Line chart of market share change since {_short_date(start)}: " + "; ".join(
+        f"{k} now {series[k][-1]:.1f}%, {delta[k]:+.1f} points" for k in series) + ".")
+    mover = max(delta_30, key=lambda k: abs(delta_30[k]))
+    return Post("share", image, headline, _caption(caption, sample), alt,
+                story_score(delta_30[mover], NOTABLE["share"]),
+                f"{mover} {delta_30[mover]:+.2f} pts in 30 days")
+
+
+# 7. Polymarket's biggest swings ---------------------------------------------------
+
+def _label_question(q: str) -> str:
+    """A Polymarket question as a short row label: the subtitle already says
+    'chance of Yes', so "Will there be no change in Fed interest rates after the
+    October 2026 meeting?" becomes "No change in Fed rates after the October 2026 meeting"."""
+    q = q.strip().rstrip("?")
+    q = re.sub(r"^Will there be ", "", q)
+    q = re.sub(r"^Will ", "", q)
+    q = q.replace("interest rates", "rates")
+    return q[:1].upper() + q[1:]
+
+
+def _two_lines(text: str, width: int) -> str:
+    """Wrap to at most two lines of `width` characters, with an ellipsis if cut."""
+    lines = textwrap.wrap(text, width)
+    if len(lines) > 2:
+        lines = [lines[0], _short_question(" ".join(lines[1:]), width)]
+    return "\n".join(lines)
+
+
+def _short_question(q: str, width: int) -> str:
+    q = q.strip()
+    return q if len(q) <= width else q[: width - 3].rstrip(" ,") + "..."
+
+
+def swings_chart(candidates: list[Market], out: Path, today: date, *, top: int = 6,
+                 sample: bool = False) -> Post:
+    """`candidates` comes from polymarket.swing_candidates, biggest move first."""
+    rows = [m for m in candidates if m.one_week_change is not None][:top]
+    if len(rows) < 3:
+        raise NoStory("Fewer than 3 liquid crypto/macro markets moved this week")
+    pairs = [(m, (m.yes_price - m.one_week_change) * 100, m.yes_price * 100) for m in rows]
+    lead, a0, b0 = pairs[0]
+    headline = f"{a0:.0f}% → {b0:.0f}%: {lead.question}"
+
+    frame = new_frame(
+        "Polymarket · biggest swings, 7 days", headline,
+        "Chance of Yes a week ago (hollow) and now (filled), crypto and macro markets",
+        "Data: Polymarket", _date_label(today),
+        hero=f"{b0 - a0:+.0f} pts", hero_sub="biggest move this week",
+        sample=sample, plot_left=0.53, plot_right=0.935,
+    )
+    ax = frame.ax
+    n = len(pairs)
+    ys = list(range(n))[::-1]
+    ax.set_ylim(-0.6, n - 0.4)
+    ax.grid(False)
+    ax.grid(axis="x", color=GRID, linewidth=0.6)
+    for y, (m, a, b) in zip(ys, pairs):
+        color = UP if b >= a else DOWN
+        rising = b >= a
+        ax.plot([a, b], [y, y], color=color, linewidth=2.6, solid_capstyle="round", zorder=2)
+        ax.scatter([a], [y], s=46, facecolor=BG, edgecolors=color, linewidths=1.6, zorder=3)
+        ax.scatter([b], [y], s=52, color=color, edgecolors=BG, linewidths=1.4, zorder=4)
+        ax.annotate(f"{a:.0f}%", (a, y), xytext=(-9 if rising else 9, 0), textcoords="offset points",
+                    va="center", ha="right" if rising else "left", fontsize=8.2, color=TEXT_3)
+        ax.annotate(f"{b:.0f}%", (b, y), xytext=(9 if rising else -9, 0), textcoords="offset points",
+                    va="center", ha="left" if rising else "right", fontsize=8.6, color=TEXT,
+                    fontweight="semibold")
+    rows_at = mtransforms.blended_transform_factory(frame.fig.transFigure, ax.transData)
+    for y, (m, _, _) in zip(ys, pairs):
+        ax.text(STYLE_LEFT, y, _two_lines(_label_question(m.question), 44), transform=rows_at,
+                fontsize=7.9, color=TEXT_2, ha="left", va="center", linespacing=1.1)
+    ax.set_yticks([])
+    ax.set_xlim(-14, 104)  # room for a "6%" label left of a dot near zero
+    ax.set_xticks([0, 25, 50, 75, 100], ["0%", "25%", "50%", "75%", "100%"])
+    ax.spines["bottom"].set_visible(False)
+
+    image = save(frame.fig, out / "swings.png")
+    short = lambda m: _short_question(m.question.removeprefix("Will ").rstrip("?"), 46)
+    body = "\n".join(f"{short(m)}: {a:.0f}% → {b:.0f}%" for m, a, b in pairs[:3])
+    caption = f"Biggest Polymarket swings this week, crypto and macro:\n\n{body}\n\nData: Polymarket"
+    alt = ("Dumbbell chart of Polymarket odds a week ago and now: " + "; ".join(
+        f"{m.question} {a:.0f}% to {b:.0f}%" for m, a, b in pairs) + ".")
+    return Post("swings", image, headline, _caption(caption, sample), alt,
+                story_score(b0 - a0, NOTABLE["swings"]), f"{b0 - a0:+.0f} pts on the top market")
+
+
+# 8. The next Fed decision ---------------------------------------------------------
+
+_FED_ORDER = ("cut", "hold", "hike")
+_FED_NAME = {"cut": "Cut", "hold": "Hold", "hike": "Hike"}
+_FED_VERB = {"cut": "cuts", "hold": "holds", "hike": "hikes"}
+_FED_NOUN = {"cut": "a Fed cut", "hold": "no change", "hike": "a Fed hike"}
+
+
+def _fed_bucket(m: Market) -> str | None:
+    t = (m.group_title or m.question).lower()
+    if "no change" in t or "hold" in t:
+        return "hold"
+    if "increase" in t or "hike" in t or "raise" in t:
+        return "hike"
+    if "decrease" in t or "cut" in t or "lower" in t:
+        return "cut"
+    return None
+
+
+def fed_odds(meeting: list[Market]) -> tuple[dict[str, float], dict[str, float]]:
+    """(now, a week ago) probability per bucket, each normalised to sum to 1."""
+    now = {k: 0.0 for k in _FED_ORDER}
+    before = {k: 0.0 for k in _FED_ORDER}
+    for m in meeting:
+        b = _fed_bucket(m)
+        if b is None or m.yes_price is None:
+            continue
+        now[b] += m.yes_price
+        before[b] += min(1.0, max(0.0, m.yes_price - (m.one_week_change or 0.0)))
+    norm = lambda d: {k: v / sum(d.values()) for k, v in d.items()} if sum(d.values()) else d
+    return norm(now), norm(before)
+
+
+def fed_chart(meeting: list[Market], out: Path, today: date, *, sample: bool = False) -> Post:
+    if len(meeting) < 2:
+        raise NoStory("No live Fed decision event with at least 2 outcomes")
+    now, before = fed_odds(meeting)
+    if not sum(now.values()):
+        raise NoStory("Fed outcomes could not be read")
+    month = fed_month(meeting) or "the next"
+    ends = [d for d in (_resolution_date(m) for m in meeting) if d]
+    resolves = min(ends) if ends else None
+    main = max(now, key=now.get)
+    mover = max(now, key=lambda k: abs(now[k] - before[k]))
+    shift = (now[mover] - before[mover]) * 100
+    if abs(shift) >= 5:
+        headline = (f"Odds of {_FED_NOUN[mover]} in {month} {'rose' if shift > 0 else 'fell'} to "
+                    f"{now[mover]*100:.0f}% from {before[mover]*100:.0f}% a week ago")
+    else:
+        headline = f"Markets see a {now[main]*100:.0f}% chance the Fed {_FED_VERB[main]} in {month}"
+
+    frame = new_frame(
+        "The next Fed decision", headline,
+        f"Polymarket odds for the {month} decision, today and a week ago",
+        "Data: Polymarket", _date_label(today),
+        hero=f"{now[main]*100:.0f}%",
+        hero_sub=f"{_FED_NAME[main].lower()}" + (f", resolves {_short_date(resolves)}" if resolves else ""),
+        sample=sample, plot_left=label_margin(["A week ago"]), plot_right=0.945,
+    )
+    ax = frame.ax
+    colors = {"cut": UP, "hold": NEUTRAL, "hike": DOWN}  # diverging: two poles, neutral middle
+    rows = [(1.0, "Today", now), (0.0, "A week ago", before)]
+    ax.set_xlim(0, 1)
+    ax.set_ylim(-0.5, 1.4)
+    renderer = frame.fig.canvas.get_renderer()
+    px_per_unit = ax.get_window_extent(renderer).width  # x runs 0..1
+    for y, _, dist in rows:
+        left = 0.0
+        for k in _FED_ORDER:
+            w = dist[k]
+            if w <= 0:
+                continue
+            ax.barh(y, w, left=left, height=0.36, color=colors[k], edgecolor=BG, linewidth=2.0,
+                    zorder=2)
+            # Label inside only when it fits with padding; try the short form, then none.
+            for label in (f"{_FED_NAME[k]} {w*100:.0f}%", f"{w*100:.0f}%"):
+                t = ax.text(left + w / 2, y, label, ha="center", va="center", fontsize=8.6,
+                            color=TEXT, fontweight="semibold", zorder=3)
+                if t.get_window_extent(renderer).width + 14 <= w * px_per_unit:
+                    break
+                t.remove()
+            left += w
+    ax.set_yticks([r[0] for r in rows], [r[1] for r in rows], fontsize=9, color=TEXT_2)
+    ax.grid(False)
+    ax.set_xticks([])
+    for side in ("bottom", "top", "left", "right"):
+        ax.spines[side].set_visible(False)
+    ax.legend(handles=[Patch(color=colors[k], label=f"{_FED_NAME[k]} {now[k]*100:.0f}% (was {before[k]*100:.0f}%)")
+                       for k in _FED_ORDER],
+              loc="upper left", bbox_to_anchor=(0, 0.02), ncol=3, frameon=False, fontsize=8.4,
+              labelcolor=TEXT_2, handlelength=0.9, handleheight=0.9, columnspacing=1.6,
+              borderaxespad=0)
+
+    image = save(frame.fig, out / "fed.png")
+    rows_txt = "\n".join(f"{_FED_NAME[k]} {now[k]*100:.0f}% (was {before[k]*100:.0f}%)" for k in reversed(_FED_ORDER))
+    settles = f"\n\nResolves {_short_date(resolves)}." if resolves else ""
+    caption = (f"{headline}.\n\nPolymarket, {month} Fed decision, now vs a week ago:\n{rows_txt}"
+               f"{settles}\n\nData: Polymarket")
+    alt = (f"Two stacked bars of Polymarket odds for the {month} Fed decision. Today: " +
+           ", ".join(f"{_FED_NAME[k].lower()} {now[k]*100:.0f}%" for k in _FED_ORDER) +
+           ". A week ago: " + ", ".join(f"{_FED_NAME[k].lower()} {before[k]*100:.0f}%" for k in _FED_ORDER) + ".")
+    soon = resolves is not None and (resolves - today).days <= 10
+    return Post("fed", image, headline, _caption(caption, sample), alt,
+                story_score(shift, NOTABLE["fed"], boost=1.25 if soon else 1.0),
+                f"{_FED_NAME[mover].lower()} {shift:+.0f} pts in a week" + (", meeting soon" if soon else ""))
