@@ -31,6 +31,12 @@ def stablecoins_raw(seed: int = 7) -> dict:
             "circulatingPrevWeek": {"peggedUSD": size - week},
             "circulatingPrevMonth": {"peggedUSD": size - week * 3},
             "price": price,
+            "chainCirculating": {  # spread over five demo chains, each with its own drift
+                f"Demo Chain {chr(65 + j)}": {
+                    "current": {"peggedUSD": size * w},
+                    "circulatingPrevMonth": {"peggedUSD": size * w * (1 - d)}}
+                for j, (w, d) in enumerate([(0.45, -0.012), (0.3, 0.018), (0.12, 0.03),
+                                             (0.08, -0.025), (0.05, 0.06)])},
         })
     return {"peggedAssets": assets}
 
@@ -89,31 +95,6 @@ def history_raw(seed: int = 7) -> dict:
         p = min(max(p, 0.03), 0.97)
         rows.append({"t": int(t.timestamp()), "p": round(p, 3)})
     return {"history": rows}
-
-
-def chain_list_raw() -> list:
-    sizes = [140e9, 92e9, 16e9, 14e9, 7e9, 5e9, 3.6e9, 3e9]
-    return [{"name": f"Demo Chain {chr(65 + i)}", "totalCirculatingUSD": {"peggedUSD": s}}
-            for i, s in enumerate(sizes)]
-
-
-def _pegged_rows(level: float, days: int, drift: float, seed: int) -> list:
-    rng = random.Random(seed)
-    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    start -= timedelta(days=days - 1)
-    rows, v = [], level * (1 - drift)
-    for d in range(days):
-        v *= 1 + drift / days + rng.gauss(0, 0.0015)
-        rows.append({"date": str(int((start + timedelta(days=d)).timestamp())),
-                     "totalCirculatingUSD": {"peggedUSD": v}})
-    return rows
-
-
-def chain_history_raw(name: str, days: int = 40) -> list:
-    sizes = {c["name"]: c["totalCirculatingUSD"]["peggedUSD"] for c in chain_list_raw()}
-    i = ord(name[-1]) - 65
-    return _pegged_rows(sizes.get(name, 1e9), days, [-0.012, 0.015, 0.02, -0.006, -0.035, 0.018,
-                                                     -0.045, -0.03][i % 8], seed=40 + i)
 
 
 def coin_history_raw(coin_id: int, days: int = 410) -> list:

@@ -13,6 +13,7 @@ import argparse
 import sys
 import time
 import traceback
+import dataclasses
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,7 +39,6 @@ class Data:
     market: object = None
     history: list = field(default_factory=list)
     markets: list = field(default_factory=list)   # top-volume plus crypto/economy topic markets
-    chains: list = field(default_factory=list)
     usdt: list = field(default_factory=list)
     usdc: list = field(default_factory=list)
 
@@ -64,9 +64,6 @@ def _load(args, fetcher: Fetcher) -> Data:
             market=polymarket.parse_market(sample.markets_raw()[0]),
             history=polymarket.parse_history(sample.history_raw()),
             markets=markets,
-            chains=[cs for name, _ in defillama.parse_chain_list(sample.chain_list_raw(), 8)
-                    if (cs := defillama.chain_supply(name, defillama.parse_pegged_history(
-                        sample.chain_history_raw(name))))],
             usdt=defillama.parse_pegged_history(sample.coin_history_raw(defillama.USDT_ID)),
             usdc=defillama.parse_pegged_history(sample.coin_history_raw(defillama.USDC_ID)),
         )
@@ -77,13 +74,12 @@ def _load(args, fetcher: Fetcher) -> Data:
         prices_f = pool.submit(defillama.fetch_price_history, fetcher)
         top_f = pool.submit(polymarket.fetch_top_markets, fetcher)
         topic_f = pool.submit(polymarket.fetch_topic_markets, fetcher)
-        chains_f = pool.submit(defillama.fetch_chains, fetcher)
         usdt_f = pool.submit(defillama.fetch_coin_history, fetcher, defillama.USDT_ID)
         usdc_f = pool.submit(defillama.fetch_coin_history, fetcher, defillama.USDC_ID)
 
         top = _optional(top_f, "Polymarket top markets", [])
         topic = _optional(topic_f, "Polymarket topic markets", [])
-        markets = polymarket.merge_markets(top, topic)
+        markets = _true_week_changes(fetcher, polymarket.merge_markets(top, topic))
         if args.market:
             market = _optional(pool.submit(polymarket.fetch_market, fetcher, args.market),
                                f"Market '{args.market}'", None)
@@ -101,9 +97,18 @@ def _load(args, fetcher: Fetcher) -> Data:
             ranges = {}
         return Data(coins=coins, points=points_f.result(), ranges=ranges, market=market,
                     history=history, markets=markets,
-                    chains=_optional(chains_f, "Chain supply", []),
                     usdt=_optional(usdt_f, "USDT history", []),
                     usdc=_optional(usdc_f, "USDC history", []))
+
+
+def _true_week_changes(fetcher: Fetcher, markets: list) -> list:
+    """Recompute the weekly move from price history for every market a chart reads it
+    from (swing candidates and the next Fed meeting); clear it everywhere else, so
+    Polymarket's unreliable oneWeekPriceChange is never used."""
+    need = {m.slug: m for m in polymarket.swing_pool(markets, min_week_volume=SWING_MIN_WEEK_VOLUME)}
+    need.update({m.slug: m for m in polymarket.fed_meeting(markets)})
+    checked = {m.slug: m for m in polymarket.with_true_week_change(fetcher, list(need.values()))}
+    return [checked.get(m.slug) or dataclasses.replace(m, one_week_change=None) for m in markets]
 
 
 # When two charts score the same, the earlier one here wins.
@@ -144,8 +149,8 @@ def cmd_daily(args) -> int:
         jobs.append(("odds", lambda: charts.odds_chart(d.market, d.history, out, sample=s)))
     else:
         print("Skipping odds chart: no chart-worthy market or no price history", file=sys.stderr)
-    if d.chains:
-        jobs.append(("chains", lambda: charts.chains_chart(d.chains, out, today, sample=s)))
+    chains = defillama.chain_supplies([c for c in d.coins if not charts._looks_frozen(c)])
+    jobs.append(("chains", lambda: charts.chains_chart(chains, out, today, sample=s)))
     if d.usdt and d.usdc:
         jobs.append(("share", lambda: charts.share_chart(d.points, d.usdt, d.usdc, out, sample=s)))
     if d.markets:

@@ -9,7 +9,7 @@ Every run makes up to eight 1600x900 PNGs, each with a draft caption and alt tex
 | `supply.png` | Total stablecoin supply, last 180 days, with the 30-day change | DefiLlama |
 | `movers.png` | Biggest 7-day mints and redemptions, each as a share of that coin's own float, plus the net | DefiLlama |
 | `pegs.png` | Price today plus the 30-day range vs $1 for the 10 largest USD stablecoins, flagging anything more than 50 bps off | DefiLlama |
-| `chains.png` | Where the dollars live: stablecoin supply on the 8 biggest chains, with each chain's 30-day change | DefiLlama |
+| `chains.png` | Where the dollars live: stablecoin supply on the 8 biggest chains, with each chain's 30-day change (from the same snapshot as movers) | DefiLlama |
 | `share.png` | USDT, USDC and everyone else: change in share of all USD stablecoins over 180 days | DefiLlama |
 | `odds.png` | 30-day Yes odds for one Polymarket market, with its resolution date | Polymarket |
 | `fed.png` | The next Fed decision on Polymarket: cut / hold / hike, today against a week ago | Polymarket |
@@ -35,6 +35,10 @@ Every chart leads with a headline worked out from the data ("$3.7B of USDX was r
 | pegs | any top-10 coin more than 50 bps off peg scores 100 |
 
 Ties go to pegs, fed, movers, swings, chains, odds, share, supply, in that order. A chart without enough data for a story that day (fewer than 3 liquid markets moved, no Fed meeting listed) prints `skip`, not `FAIL`.
+
+Weekly odds moves (fed, swings) come from each market's price history, not from Polymarket's
+`oneWeekPriceChange` field. That field is unreliable: on Oct 21, 2026 it put the October Fed
+"no change" market at +27.5 points on the week when the history shows +8.
 
 The swings chart only counts markets that match crypto or macro keywords, traded $100K+ in the week, are between 4% and 96%, and are not sports or daily up/down bets, one market per event. That is a small set, often 3 to 6 markets, which is the point.
 
@@ -74,7 +78,8 @@ Some responses are trimmed before they are saved, because they are mostly data n
 Rows and market objects are always saved whole, so every number behind a chart is still there:
 
 - `defillama_stablecoin_prices.json`: trailing 30 days (the endpoint returns about 6 MB back to 2020)
-- `defillama_chain_*.json`, `defillama_coin_*.json`: trailing 40 and 190 days
+- `defillama_coin_*.json`: trailing 190 days
+- `polymarket_week_*.json`: the last 9 days of each market's price history
 - `polymarket_events_*.json`: only markets that traded $20K+ in the week (each feed is 2 to 4 MB)
 
 ## Run it daily on GitHub (free)

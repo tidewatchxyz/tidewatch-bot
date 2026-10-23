@@ -7,9 +7,11 @@ Endpoints:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -158,6 +160,15 @@ _NOT_NEWS = re.compile(r"\bup or down\b|\bO/U\b|\bvs\.?\b|\bwin on \d{4}-|\blead
                        re.I)
 
 
+def swing_pool(markets: list[Market], *, min_week_volume: float = 250e3) -> list[Market]:
+    """Liquid crypto and macro markets that could be a swing, before knowing how far
+    each one moved: no sports, no daily up/down bets, not about to settle."""
+    return [m for m in markets
+            if m.yes_price is not None and not m.is_sports and CRYPTO_MACRO.search(m.question)
+            and not _NOT_NEWS.search(m.question) and 0.04 <= m.yes_price <= 0.96
+            and (m.volume_1wk or 0) >= min_week_volume]
+
+
 def swing_candidates(markets: list[Market], *, min_week_volume: float = 250e3) -> list[Market]:
     """Crypto and macro markets whose weekly odds move means something.
 
@@ -167,11 +178,8 @@ def swing_candidates(markets: list[Market], *, min_week_volume: float = 250e3) -
     fill the chart with its five outcomes.
     """
     best: dict[str, Market] = {}
-    for m in markets:
-        p = m.yes_price
-        if (p is None or m.one_week_change is None or m.is_sports
-                or not CRYPTO_MACRO.search(m.question) or _NOT_NEWS.search(m.question)
-                or not 0.04 <= p <= 0.96 or (m.volume_1wk or 0) < min_week_volume):
+    for m in swing_pool(markets, min_week_volume=min_week_volume):
+        if m.one_week_change is None:
             continue
         key = m.event_id or m.slug
         if key not in best or abs(m.one_week_change) > abs(best[key].one_week_change or 0):
@@ -283,6 +291,56 @@ def merge_markets(*lists: list[Market]) -> list[Market]:
         for m in ms:
             seen.setdefault(m.slug or m.question, m)
     return list(seen.values())
+
+
+# Week-ago odds ------------------------------------------------------------------
+#
+# Gamma's oneWeekPriceChange is not reliable. On Oct 21, 2026 it put the October
+# Fed "no change" market at +27.5 points on the week (from 61%); the CLOB price
+# history shows 80.5% a week earlier and never below 70.5% all week. A draft built
+# on it said "rose to 88% from 60%". So the week-ago price comes from the history.
+
+def week_ago_price(history: list[PricePoint], days: int = 7) -> float | None:
+    """The last traded price at or before `days` before the latest point, or None
+    when the history does not reach back that far."""
+    if not history:
+        return None
+    target = history[-1].at - timedelta(days=days)
+    before = [p for p in history if p.at <= target]
+    return before[-1].price if before else None
+
+
+def trim_history(raw: Any, days: int = 9) -> Any:
+    rows = raw.get("history") if isinstance(raw, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return raw
+    try:
+        cutoff = max(int(r["t"]) for r in rows) - days * 86400
+        return {**raw, "history": [r for r in rows if int(r["t"]) >= cutoff]}
+    except (KeyError, TypeError, ValueError):
+        return raw
+
+
+def with_true_week_change(fetcher: Fetcher, markets: list[Market], days: int = 7) -> list[Market]:
+    """The same markets with one_week_change recomputed from price history. A market
+    whose history cannot be fetched, or does not go back far enough, gets None, so
+    it drops out of any chart that needs the weekly move rather than being guessed."""
+    def one(m: Market) -> Market:
+        try:
+            raw = fetcher.get_json(
+                f"{CLOB}/prices-history",
+                {"market": m.token_ids[0], "interval": "1m", "fidelity": 360},
+                name=f"polymarket_week_{m.token_ids[0][:16]}",
+                trim=lambda r: trim_history(r, days + 2))
+            then = week_ago_price(parse_history(raw), days)
+        except Exception:  # noqa: BLE001  one missing history drops one market
+            then = None
+        change = None if then is None or m.yes_price is None else m.yes_price - then
+        return dataclasses.replace(m, one_week_change=change)
+
+    todo = [m for m in markets if m.token_ids]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(one, todo))
 
 
 def fetch_market(fetcher: Fetcher, slug: str) -> Market:

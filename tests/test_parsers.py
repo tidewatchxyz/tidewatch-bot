@@ -337,12 +337,65 @@ class SwingAndFedTests(unittest.TestCase):
                          "Bitcoin dip to $77,500 in October")
 
 
+class WeekAgoTests(unittest.TestCase):
+    @staticmethod
+    def _history(points):
+        from datetime import datetime, timezone
+        return {"history": [{"t": int(datetime(2026, 10, d, h, tzinfo=timezone.utc).timestamp()), "p": p}
+                            for d, h, p in points]}
+
+    def test_week_ago_is_the_last_price_at_or_before_seven_days(self):
+        h = polymarket.parse_history(self._history([(13, 12, 0.805), (14, 12, 0.805), (15, 12, 0.725),
+                                                    (21, 12, 0.885)]))
+        self.assertAlmostEqual(polymarket.week_ago_price(h), 0.805)  # Oct 14 12:00, not Oct 15
+
+    def test_short_history_gives_none(self):
+        h = polymarket.parse_history(self._history([(20, 0, 0.5), (21, 12, 0.6)]))
+        self.assertIsNone(polymarket.week_ago_price(h))
+
+    def test_history_overrides_gammas_weekly_change(self):
+        """Oct 21, 2026: Gamma said +27.5 pts (from 61%), the history says 80.5% -> 88.5%."""
+        hist = self._history([(13, 12, 0.805), (14, 12, 0.805), (15, 0, 0.705), (21, 12, 0.885)])
+
+        class Replay:
+            def get_json(self, url, params=None, *, name, trim=None):
+                return trim(hist) if trim else hist
+
+        m = polymarket.Market("Will there be no change in Fed interest rates after the October 2026 meeting?",
+                              "fed-oct", ["Yes", "No"], [0.885, 0.115], ["tok", "tok2"], 1e6, None,
+                              one_week_change=0.275)
+        fixed = polymarket.with_true_week_change(Replay(), [m])[0]
+        self.assertAlmostEqual(fixed.one_week_change, 0.08, places=6)
+
+    def test_missing_history_drops_the_market(self):
+        class Broken:
+            def get_json(self, *a, **k):
+                raise RuntimeError("down")
+
+        m = polymarket.Market("Will Bitcoin reach $150k?", "btc", ["Yes", "No"], [0.3, 0.7], ["t", "u"], 1e6,
+                              None, volume_1wk=1e6, one_week_change=-0.6)
+        fixed = polymarket.with_true_week_change(Broken(), [m])
+        self.assertIsNone(fixed[0].one_week_change)
+        self.assertEqual(polymarket.swing_candidates(fixed), [])
+
+
 class ChainAndShareTests(unittest.TestCase):
-    def test_chain_change_over_window(self):
-        hist = [(date(2026, 9, d), 100e9) for d in range(1, 30)] + [(date(2026, 10, 21), 103e9)]
-        cs = defillama.chain_supply("Tron", hist, days=30)
-        self.assertAlmostEqual(cs.change, 3e9)
-        self.assertAlmostEqual(cs.change_pct, 0.03)
+    def test_chain_totals_sum_usd_coins_per_chain(self):
+        raw = {"peggedAssets": [
+            {"name": "A", "symbol": "A", "pegType": "peggedUSD", "circulating": {"peggedUSD": 103e9},
+             "chainCirculating": {"Tron": {"current": {"peggedUSD": 100e9},
+                                           "circulatingPrevMonth": {"peggedUSD": 97e9}},
+                                  "Base": {"current": {"peggedUSD": 3e9},
+                                           "circulatingPrevMonth": {"peggedUSD": 3e9}}}},
+            {"name": "B", "symbol": "B", "pegType": "peggedUSD", "circulating": {"peggedUSD": 2e9},
+             "chainCirculating": {"Tron": {"current": {"peggedUSD": 2e9},
+                                           "circulatingPrevMonth": {"peggedUSD": 2e9}}}},
+            {"name": "E", "symbol": "E", "pegType": "peggedEUR", "circulating": {"peggedEUR": 9e9},
+             "chainCirculating": {"Tron": {"current": {"peggedEUR": 9e9}}}}]}
+        tron, base = defillama.chain_supplies(defillama.parse_stablecoins(raw))
+        self.assertEqual((tron.name, base.name), ("Tron", "Base"))
+        self.assertAlmostEqual(tron.change, 3e9)        # the EUR coin is not counted
+        self.assertAlmostEqual(tron.change_pct, 3 / 99)
 
     def test_pegged_history_reads_only_dollar_pegs(self):
         rows = [{"date": "1700000000", "totalCirculatingUSD": {"peggedUSD": 5.0, "peggedEUR": 99.0}},
@@ -374,8 +427,7 @@ class ChartSmokeTests(unittest.TestCase):
         market = polymarket.parse_market(sample.markets_raw()[0])
         history = polymarket.parse_history(sample.history_raw())
         markets = polymarket.parse_events(sample.topic_events_raw())
-        chains = [defillama.chain_supply(n, defillama.parse_pegged_history(sample.chain_history_raw(n)))
-                  for n, _ in defillama.parse_chain_list(sample.chain_list_raw(), 8)]
+        chains = defillama.chain_supplies(coins)
         usdt = defillama.parse_pegged_history(sample.coin_history_raw(defillama.USDT_ID))
         usdc = defillama.parse_pegged_history(sample.coin_history_raw(defillama.USDC_ID))
         with tempfile.TemporaryDirectory() as d:

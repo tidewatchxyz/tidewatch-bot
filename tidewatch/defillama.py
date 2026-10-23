@@ -8,9 +8,8 @@ Endpoints:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable
 
 from .http import Fetcher
@@ -32,6 +31,8 @@ class Stablecoin:
     price: float | None
     yield_bearing: bool = False
     gecko_id: str = ""
+    # chain -> (supply now, supply a month ago) for this coin, from chainCirculating
+    chains: dict[str, tuple[float, float]] = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def change_7d(self) -> float | None:
@@ -50,6 +51,17 @@ def _peg_amount(block: Any, peg_type: str) -> float | None:
         return None
     value = block.get(peg_type)
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _chain_split(block: Any, peg: str) -> dict[str, tuple[float, float]]:
+    out = {}
+    for chain, v in (block or {}).items() if isinstance(block, dict) else []:
+        if not isinstance(v, dict):
+            continue
+        now = _peg_amount(v.get("current"), peg)
+        if now:
+            out[chain] = (now, _peg_amount(v.get("circulatingPrevMonth"), peg) or 0.0)
+    return out
 
 
 def parse_stablecoins(raw: dict) -> list[Stablecoin]:
@@ -73,6 +85,7 @@ def parse_stablecoins(raw: dict) -> list[Stablecoin]:
                 price=float(price) if isinstance(price, (int, float)) else None,
                 yield_bearing=a.get("yieldBearing") is True,
                 gecko_id=a.get("gecko_id") or "",
+                chains=_chain_split(a.get("chainCirculating"), peg),
             )
         )
     out.sort(key=lambda s: s.circulating, reverse=True)
@@ -180,7 +193,7 @@ USDT_ID, USDC_ID = 1, 2  # DefiLlama stablecoin ids
 class ChainSupply:
     name: str
     now: float          # USD-pegged stablecoins on the chain today
-    before: float       # the same, CHAIN_WINDOW_DAYS ago
+    before: float       # the same, a month ago
 
     @property
     def change(self) -> float:
@@ -191,22 +204,29 @@ class ChainSupply:
         return self.change / self.before if self.before else 0.0
 
 
+def chain_supplies(coins: list[Stablecoin], *, top: int = 8) -> list[ChainSupply]:
+    """Supply per chain, summed over USD stablecoins, from the same /stablecoins
+    snapshot the movers chart uses. Pass the coins already filtered for frozen data.
+
+    (Per-chain history endpoints give nearly the same totals but cost nine slow
+    calls, about 40 seconds and more when DefiLlama is busy.)"""
+    now: dict[str, float] = {}
+    before: dict[str, float] = {}
+    for c in coins:
+        if c.peg_type != "peggedUSD":
+            continue
+        for chain, (n, b) in c.chains.items():
+            now[chain] = now.get(chain, 0.0) + n
+            before[chain] = before.get(chain, 0.0) + b
+    biggest = sorted(now, key=now.get, reverse=True)[:top]
+    return [ChainSupply(name=ch, now=now[ch], before=before[ch]) for ch in biggest if before[ch] > 0]
+
+
 def _trim_rows(raw: Any, keep: int) -> Any:
     """Trailing daily rows of a /stablecoincharts response, kept whole."""
     if not isinstance(raw, list):
         return raw
     return sorted((r for r in raw if isinstance(r, dict)), key=_row_ts)[-keep:]
-
-
-def parse_chain_list(raw: Any, top: int) -> list[tuple[str, float]]:
-    """The `top` chains by USD-pegged supply, from /stablecoinchains."""
-    rows = []
-    for c in raw if isinstance(raw, list) else []:
-        amount = _peg_amount(c.get("totalCirculatingUSD"), "peggedUSD") if isinstance(c, dict) else None
-        if amount and c.get("name"):
-            rows.append((str(c["name"]), amount))
-    rows.sort(key=lambda t: t[1], reverse=True)
-    return rows[:top]
 
 
 def parse_pegged_history(raw: Any) -> list[tuple[date, float]]:
@@ -219,28 +239,6 @@ def parse_pegged_history(raw: Any) -> list[tuple[date, float]]:
             out.append((datetime.fromtimestamp(ts, tz=timezone.utc).date(), amount))
     out.sort()
     return out
-
-
-def chain_supply(name: str, history: list[tuple[date, float]],
-                 days: int = CHAIN_WINDOW_DAYS) -> ChainSupply | None:
-    if len(history) < 2:
-        return None
-    last_day, now = history[-1]
-    before = next((v for d, v in reversed(history) if (last_day - d).days >= days), history[0][1])
-    return ChainSupply(name=name, now=now, before=before)
-
-
-def fetch_chains(fetcher: Fetcher, *, top: int = 8, days: int = CHAIN_WINDOW_DAYS) -> list[ChainSupply]:
-    raw = fetcher.get_json(f"{BASE}/stablecoinchains", name="defillama_stablecoin_chains")
-
-    def one(name: str) -> ChainSupply | None:
-        hist = fetcher.get_json(f"{BASE}/stablecoincharts/{name}", name=f"defillama_chain_{name}",
-                                trim=lambda r: _trim_rows(r, days + 10))
-        return chain_supply(name, parse_pegged_history(hist), days)
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        found = list(pool.map(one, [name for name, _ in parse_chain_list(raw, top)]))
-    return [c for c in found if c]
 
 
 def fetch_coin_history(fetcher: Fetcher, coin_id: int, *,
